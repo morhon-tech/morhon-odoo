@@ -1,18 +1,25 @@
 #!/bin/bash
 
-# Odoo VPS 管理脚本 - 增强版
-# 支持本地部署和智能镜像源选择
+# 茂亨Odoo外贸专用版管理脚本 - 优化版
+# 单实例版本，支持本地模式和域名模式
 # 版本: 6.0
+# GitHub: https://github.com/morhon-tech/morhon-odoo
 
 set -e
 
 # 配置变量
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="/etc/odoo-manager"
-INSTANCES_BASE="/opt"
-BACKUP_DIR="/var/backups/odoo"
-LOG_DIR="/var/log/odoo-manager"
-DOCKER_NETWORK="odoo-network"
+INSTANCE_DIR="/opt/morhon-odoo"
+BACKUP_DIR="/var/backups/morhon-odoo"
+LOG_DIR="/var/log/morhon-odoo"
+
+# 固定卷名
+DB_VOLUME_NAME="odoo-db-data"
+ODOO_VOLUME_NAME="odoo-web-data"
+
+# 固定镜像配置
+ODOO_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest"
+POSTGRES_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/postgres:latest"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -21,63 +28,155 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
+
+# 全局状态变量
+DETECTED_INSTANCE_TYPE=""  # none, script, manual
+DETECTED_ODOO_CONTAINER=""
+DETECTED_DB_CONTAINER=""
+DETECTED_DOMAIN=""
+DETECTED_DB_PASSWORD=""
+HAS_LOCAL_BACKUP=false
 
 # 日志函数
 log() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | sudo tee -a "$LOG_DIR/odoo-manager.log"
+    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
 }
 
 log_error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" | sudo tee -a "$LOG_DIR/odoo-manager.log" >&2
-}
-
-log_warn() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | sudo tee -a "$LOG_DIR/odoo-manager.log"
+    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log" >&2
 }
 
 log_info() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1" | sudo tee -a "$LOG_DIR/odoo-manager.log"
+    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
 }
 
 # 检查是否为sudo用户
 check_sudo() {
-    if [ "$(id -u)" -eq 0 ]; then
-        log_warn "检测到以root用户运行，建议使用sudo用户运行"
-        read -p "是否继续使用root用户运行？(y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            echo "请使用sudo用户重新运行脚本: sudo -u $(logname) $0"
-            exit 1
+    if [ "$EUID" -ne 0 ]; then
+        echo "此脚本需要root权限，请使用sudo运行"
+        exit 1
+    fi
+}
+
+# 一次性检测所有信息
+detect_environment() {
+    log_info "检测系统环境..."
+    
+    # 创建必要目录
+    mkdir -p "$INSTANCE_DIR" "$BACKUP_DIR" "$LOG_DIR"
+    
+    # 1. 检测脚本管理的实例
+    if [ -f "$INSTANCE_DIR/docker-compose.yml" ]; then
+        DETECTED_INSTANCE_TYPE="script"
+        log "检测到脚本管理的实例: $INSTANCE_DIR"
+        return 0
+    fi
+    
+    # 2. 检测手动部署的实例
+    # 查找使用茂亨镜像的容器
+    local odoo_container=$(docker ps -a --filter "ancestor=$ODOO_IMAGE" --format "{{.Names}}" 2>/dev/null | head -1)
+    
+    if [ -z "$odoo_container" ]; then
+        # 查找名称包含morhon或odoo的容器
+        odoo_container=$(docker ps -a --filter "name=morhon" --format "{{.Names}}" 2>/dev/null | head -1)
+        [ -z "$odoo_container" ] && odoo_container=$(docker ps -a --filter "name=odoo" --format "{{.Names}}" 2>/dev/null | head -1)
+    fi
+    
+    if [ -n "$odoo_container" ]; then
+        DETECTED_INSTANCE_TYPE="manual"
+        DETECTED_ODOO_CONTAINER="$odoo_container"
+        
+        # 获取数据库容器
+        DETECTED_DB_CONTAINER=$(docker ps -a --filter "name=postgres" --format "{{.Names}}" 2>/dev/null | head -1)
+        [ -z "$DETECTED_DB_CONTAINER" ] && DETECTED_DB_CONTAINER=$(docker ps -a --filter "name=db" --format "{{.Names}}" 2>/dev/null | head -1)
+        
+        # 尝试从容器获取域名和密码
+        extract_instance_info
+        log "检测到手动部署的实例: $DETECTED_ODOO_CONTAINER"
+        return 0
+    fi
+    
+    # 3. 无实例，检查脚本目录下是否有备份文件
+    DETECTED_INSTANCE_TYPE="none"
+    
+    # 检查备份文件（.tar.gz格式）
+    local backup_files=($(find "$SCRIPT_DIR" -maxdepth 1 -name "*.tar.gz" -type f))
+    if [ ${#backup_files[@]} -gt 0 ]; then
+        HAS_LOCAL_BACKUP=true
+        log "检测到脚本目录下的备份文件: ${#backup_files[@]}个"
+    fi
+    
+    return 0
+}
+
+# 从手动部署实例提取信息
+extract_instance_info() {
+    log_info "从手动部署实例提取信息..."
+    
+    # 1. 尝试从odoo容器获取odoo.conf内容
+    if [ -n "$DETECTED_ODOO_CONTAINER" ]; then
+        # 获取odoo.conf配置文件内容
+        local odoo_conf_content=$(docker exec "$DETECTED_ODOO_CONTAINER" cat /etc/odoo/odoo.conf 2>/dev/null || docker exec "$DETECTED_ODOO_CONTAINER" cat /odoo/config/odoo.conf 2>/dev/null || true)
+        
+        if [ -n "$odoo_conf_content" ]; then
+            # 提取管理员密码
+            local admin_passwd=$(echo "$odoo_conf_content" | grep "^admin_passwd" | cut -d'=' -f2 | sed 's/[[:space:]]*//g')
+            [ -n "$admin_passwd" ] && log "提取到管理员密码"
+            
+            # 提取数据库名（可能是域名）
+            local db_name=$(echo "$odoo_conf_content" | grep "^db_name" | cut -d'=' -f2 | sed 's/[[:space:]]*//g')
+            if [[ "$db_name" == *.* ]]; then
+                # 从数据库名中提取域名（例如 trade.morhon.com -> morhon.com）
+                DETECTED_DOMAIN=$(echo "$db_name" | awk -F'.' '{print $(NF-1)"."$NF}')
+                log "从数据库名提取到域名: $DETECTED_DOMAIN (原始: $db_name)"
+            fi
         fi
-        log_warn "继续以root用户运行"
-    elif ! sudo -n true 2>/dev/null; then
-        echo "此脚本需要sudo权限，请输入密码:"
-        if ! sudo -v; then
-            echo "无法获取sudo权限，请确保您有sudo权限"
-            exit 1
+        
+        # 尝试从容器环境变量获取域名
+        if [ -z "$DETECTED_DOMAIN" ]; then
+            local env_vars=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$DETECTED_ODOO_CONTAINER" 2>/dev/null || true)
+            DETECTED_DOMAIN=$(echo "$env_vars" | grep -E "DOMAIN|HOSTNAME" | cut -d'=' -f2 | head -1)
         fi
     fi
+    
+    # 2. 尝试从数据库容器获取密码
+    if [ -n "$DETECTED_DB_CONTAINER" ]; then
+        DETECTED_DB_PASSWORD=$(docker exec "$DETECTED_DB_CONTAINER" env 2>/dev/null | grep "POSTGRES_PASSWORD" | cut -d'=' -f2 || echo "odoo")
+        log "提取到数据库密码"
+    fi
+    
+    # 3. 尝试从Nginx配置获取域名
+    if [ -z "$DETECTED_DOMAIN" ]; then
+        if [ -d "/etc/nginx/sites-enabled" ]; then
+            local nginx_domain=$(grep -r "server_name" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "_" | head -1 | awk '{print $2}' | sed 's/;//')
+            if [[ "$nginx_domain" == *.* ]] && [ "$nginx_domain" != "localhost" ]; then
+                DETECTED_DOMAIN="$nginx_domain"
+                log "从Nginx配置提取到域名: $DETECTED_DOMAIN"
+            fi
+        fi
+    fi
+    
+    return 0
 }
 
 # 获取服务器IP地址
 get_server_ip() {
-    # 尝试多种方法获取公网IP
     local ip=""
     
-    # 方法1: 使用ip命令获取默认路由的IP
-    ip=$(ip route get 1.2.3.4 | awk '{print $7}' | head -1)
+    # 方法1: 使用ip命令
+    ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || true)
     
-    # 方法2: 使用curl获取外部IP
+    # 方法2: 使用curl
     if [ -z "$ip" ] || [[ "$ip" == *" "* ]] || [[ "$ip" == "127.0.0.1" ]]; then
         ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || true)
     fi
     
-    # 方法3: 使用hostname获取
+    # 方法3: 使用hostname
     if [ -z "$ip" ] || [[ "$ip" == *" "* ]] || [[ "$ip" == "127.0.0.1" ]]; then
         ip=$(hostname -I | awk '{print $1}')
     fi
     
-    # 如果还是获取不到，使用127.0.0.1
     if [ -z "$ip" ] || [[ "$ip" == *" "* ]]; then
         ip="127.0.0.1"
     fi
@@ -85,192 +184,19 @@ get_server_ip() {
     echo "$ip"
 }
 
-# 检测Ubuntu版本
-detect_ubuntu_version() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        if [ "$ID" = "ubuntu" ]; then
-            log "检测到 Ubuntu $VERSION_ID"
-            return 0
-        else
-            log_warn "当前系统不是Ubuntu，但将继续尝试执行"
-            return 1
-        fi
-    else
-        log_error "无法检测操作系统"
-        exit 1
-    fi
-}
-
-# 检测网络连通性
-check_network_connectivity() {
-    log_info "检测网络连通性..."
-    
-    local test_urls=(
-        "https://hub.docker.com"
-        "https://registry-1.docker.io"
-        "https://index.docker.io"
-        "https://registry.cn-hangzhou.aliyuncs.com"
-    )
-    
-    local docker_available=false
-    local aliyun_available=false
-    
-    for url in "${test_urls[@]}"; do
-        if curl -s --max-time 3 -I "$url" >/dev/null 2>&1; then
-            if [[ "$url" == *"aliyuncs"* ]]; then
-                aliyun_available=true
-                log "阿里云镜像仓库可达: $url"
-            else
-                docker_available=true
-                log "Docker官方仓库可达: $url"
-            fi
-        fi
-    done
-    
-    # 设置镜像源策略
-    if [ "$docker_available" = true ]; then
-        export USE_DOCKER_HUB=true
-        log "将优先使用Docker官方镜像源"
-    else
-        export USE_DOCKER_HUB=false
-        log_warn "Docker官方镜像源不可达，将使用国内镜像源"
-    fi
-    
-    if [ "$aliyun_available" = true ]; then
-        export ALIYUN_AVAILABLE=true
-    else
-        export ALIYUN_AVAILABLE=false
-    fi
-}
-
-# 获取系统信息
-get_system_info() {
-    log_info "获取系统信息..."
-    
-    # 检测网络连通性
-    check_network_connectivity
-    
-    # CPU信息
-    CPU_CORES=$(nproc)
-    CPU_MODEL=$(lscpu | grep "Model name" | cut -d':' -f2 | sed 's/^[ \t]*//' | head -1)
-    
-    # 内存信息
-    TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
-    AVAILABLE_MEM=$(free -g | awk '/^Mem:/{print $7}')
-    
-    # 磁盘信息
-    DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
-    DISK_AVAILABLE=$(df -h / | awk 'NR==2 {print $4}')
-    
-    # 获取服务器IP
-    SERVER_IP=$(get_server_ip)
-    
-    log "系统信息:"
-    log "  CPU核心: $CPU_CORES ($CPU_MODEL)"
-    log "  总内存: ${TOTAL_MEM}GB (可用: ${AVAILABLE_MEM}GB)"
-    log "  磁盘空间: ${DISK_TOTAL} (可用: ${DISK_AVAILABLE})"
-    log "  服务器IP: $SERVER_IP"
-    log "  Docker官方源: $(if [ "$USE_DOCKER_HUB" = true ]; then echo "可用"; else echo "不可用"; fi)"
-    log "  阿里云源: $(if [ "$ALIYUN_AVAILABLE" = true ]; then echo "可用"; else echo "不可用"; fi)"
-    
-    # 根据系统资源计算优化参数
-    calculate_optimization_params
-}
-
-# 计算优化参数
-calculate_optimization_params() {
-    # 计算workers数量 (基于CPU核心数)
-    if [ $CPU_CORES -ge 8 ]; then
-        WORKERS=8
-        MAX_CRON_THREADS=4
-    elif [ $CPU_CORES -ge 4 ]; then
-        WORKERS=6
-        MAX_CRON_THREADS=3
-    elif [ $CPU_CORES -ge 2 ]; then
-        WORKERS=4
-        MAX_CRON_THREADS=2
-    else
-        WORKERS=2
-        MAX_CRON_THREADS=1
-    fi
-    
-    # 计算内存限制 (基于可用内存)
-    if [ $TOTAL_MEM -ge 32 ]; then
-        LIMIT_MEMORY_HARD="8192M"
-        LIMIT_MEMORY_SOFT="6144M"
-        DB_SHARED_BUFFERS="2GB"
-        DB_EFFECTIVE_CACHE_SIZE="6GB"
-        DB_WORK_MEM="64MB"
-        DB_MAINTENANCE_WORK_MEM="512MB"
-    elif [ $TOTAL_MEM -ge 16 ]; then
-        LIMIT_MEMORY_HARD="4096M"
-        LIMIT_MEMORY_SOFT="3072M"
-        DB_SHARED_BUFFERS="1GB"
-        DB_EFFECTIVE_CACHE_SIZE="3GB"
-        DB_WORK_MEM="32MB"
-        DB_MAINTENANCE_WORK_MEM="256MB"
-    elif [ $TOTAL_MEM -ge 8 ]; then
-        LIMIT_MEMORY_HARD="2048M"
-        LIMIT_MEMORY_SOFT="1536M"
-        DB_SHARED_BUFFERS="512MB"
-        DB_EFFECTIVE_CACHE_SIZE="1536MB"
-        DB_WORK_MEM="16MB"
-        DB_MAINTENANCE_WORK_MEM="128MB"
-    elif [ $TOTAL_MEM -ge 4 ]; then
-        LIMIT_MEMORY_HARD="1024M"
-        LIMIT_MEMORY_SOFT="768M"
-        DB_SHARED_BUFFERS="256MB"
-        DB_EFFECTIVE_CACHE_SIZE="768MB"
-        DB_WORK_MEM="8MB"
-        DB_MAINTENANCE_WORK_MEM="64MB"
-    else
-        LIMIT_MEMORY_HARD="512M"
-        LIMIT_MEMORY_SOFT="384M"
-        DB_SHARED_BUFFERS="128MB"
-        DB_EFFECTIVE_CACHE_SIZE="384MB"
-        DB_WORK_MEM="4MB"
-        DB_MAINTENANCE_WORK_MEM="32MB"
-    fi
-    
-    # 计算CPU限制
-    if [ $CPU_CORES -ge 4 ]; then
-        CPU_LIMIT="2.0"
-    elif [ $CPU_CORES -ge 2 ]; then
-        CPU_LIMIT="1.0"
-    else
-        CPU_LIMIT="0.5"
-    fi
-    
-    log_info "优化参数计算完成:"
-    log "  Workers数量: $WORKERS"
-    log "  Cron线程: $MAX_CRON_THREADS"
-    log "  内存限制: $LIMIT_MEMORY_SOFT (软) / $LIMIT_MEMORY_HARD (硬)"
-    log "  CPU限制: $CPU_LIMIT"
-    log "  数据库缓存: $DB_SHARED_BUFFERS"
-}
-
 # 初始化环境
 init_environment() {
     log "初始化环境..."
     
-    detect_ubuntu_version
-    
-    # 创建必要的目录
-    sudo mkdir -p "$CONFIG_DIR"
-    sudo mkdir -p "$INSTANCES_BASE"
-    sudo mkdir -p "$BACKUP_DIR"
-    sudo mkdir -p "$LOG_DIR"
-    
     # 更新系统
     log "更新系统包..."
     export DEBIAN_FRONTEND=noninteractive
-    sudo apt-get update
-    sudo apt-get upgrade -y
+    apt-get update
+    apt-get upgrade -y
     
     # 安装系统依赖
     log "安装系统依赖..."
-    sudo apt-get install -y \
+    apt-get install -y \
         curl \
         wget \
         git \
@@ -279,14 +205,11 @@ init_environment() {
         gzip \
         python3 \
         python3-pip \
-        python3-venv \
         postgresql-client \
         certbot \
         python3-certbot-nginx \
         nginx \
         ufw \
-        fail2ban \
-        htop \
         net-tools \
         software-properties-common \
         apt-transport-https \
@@ -294,83 +217,35 @@ init_environment() {
         gnupg \
         lsb-release
     
-    # 安装中文字体
-    log "安装中文字体..."
-    sudo apt-get install -y \
-        fonts-wqy-zenhei \
-        fonts-wqy-microhei \
-        fonts-noto-cjk \
-        fonts-arphic-uming \
-        fonts-arphic-ukai \
-        ttf-mscorefonts-installer
-    
-    # 安装Docker（如果不存在）
+    # 安装Docker
     if ! command -v docker &> /dev/null; then
         log "安装Docker..."
         # 添加Docker官方GPG密钥
-        sudo mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
         
-        sudo apt-get update
-        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        apt-get update
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
-        # 将当前用户添加到docker组
-        sudo usermod -aG docker $(whoami) || true
-        log "已将用户 $(whoami) 添加到docker组，请重新登录或重新打开终端以生效"
+        log "Docker安装完成"
     fi
     
-    # 安装Docker Compose（独立版本）
+    # 安装Docker Compose
     if ! command -v docker-compose &> /dev/null; then
         log "安装Docker Compose..."
-        sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        sudo chmod +x /usr/local/bin/docker-compose
-    fi
-    
-    # 下载微软雅黑字体（解决PDF中文问题）
-    log "下载额外中文字体..."
-    sudo mkdir -p /usr/share/fonts/truetype/custom
-    if [ ! -f "/usr/share/fonts/truetype/custom/msyh.ttf" ]; then
-        sudo wget -q -O /tmp/msyh.ttf https://github.com/adobe-fonts/source-han-sans/raw/release/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf
-        sudo mv /tmp/msyh.ttf /usr/share/fonts/truetype/custom/
-    fi
-    
-    if [ ! -f "/usr/share/fonts/truetype/custom/simhei.ttf" ]; then
-        sudo wget -q -O /tmp/simhei.ttf https://github.com/be5invis/source-han-sans-ttf/raw/main/SubsetOTF/CN/SourceHanSansCN-Normal.ttf
-        sudo mv /tmp/simhei.ttf /usr/share/fonts/truetype/custom/
-    fi
-    
-    # 更新字体缓存
-    sudo fc-cache -fv
-    
-    # 创建docker网络（如果不存在）
-    if ! sudo docker network ls | grep -q "$DOCKER_NETWORK"; then
-        sudo docker network create "$DOCKER_NETWORK"
+        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
     fi
     
     # 配置防火墙
     configure_firewall
     
-    # 优化系统参数
-    optimize_system
-    
-    # 智能配置Docker镜像源
-    optimize_docker
-    
     # 配置Nginx
     configure_nginx
     
-    # 设置权限
-    sudo chmod 755 "$INSTANCES_BASE"
-    sudo chmod 755 "$BACKUP_DIR"
-    
-    # 为当前用户设置适当的权限
-    CURRENT_USER=$(whoami)
-    sudo chown -R $CURRENT_USER:$CURRENT_USER "$INSTANCES_BASE" 2>/dev/null || true
-    sudo chown -R $CURRENT_USER:$CURRENT_USER "$BACKUP_DIR" 2>/dev/null || true
-    sudo chown -R $CURRENT_USER:$CURRENT_USER "$LOG_DIR" 2>/dev/null || true
-    
     log "环境初始化完成"
+    return 0
 }
 
 # 配置防火墙
@@ -378,189 +253,28 @@ configure_firewall() {
     log "配置防火墙..."
     
     # 重置防火墙规则
-    sudo ufw --force reset
+    ufw --force reset
     
-    # 默认策略：拒绝所有入站，允许所有出站
-    sudo ufw default deny incoming
-    sudo ufw default allow outgoing
+    # 默认策略
+    ufw default deny incoming
+    ufw default allow outgoing
     
     # 允许SSH
-    sudo ufw allow 22/tcp
+    ufw allow 22/tcp
     log "已允许SSH端口 (22/tcp)"
     
-    # 允许HTTP (用于Web访问)
-    sudo ufw allow 80/tcp
+    # 允许HTTP
+    ufw allow 80/tcp
     log "已允许HTTP端口 (80/tcp)"
     
     # 允许HTTPS
-    sudo ufw allow 443/tcp
+    ufw allow 443/tcp
     log "已允许HTTPS端口 (443/tcp)"
     
-    # 允许Odoo端口范围 (仅在需要时开放)
-    # 默认不开放，只有在本地部署模式且需要时才会开放
-    
     # 启用UFW
-    sudo ufw --force enable
-    
-    # 显示防火墙状态
-    log "防火墙状态:"
-    sudo ufw status numbered
+    ufw --force enable
     
     log "防火墙配置完成"
-}
-
-# 优化系统参数
-optimize_system() {
-    log "优化系统参数..."
-    
-    # 创建sysctl优化配置
-    sudo tee /etc/sysctl.d/99-odoo-optimization.conf > /dev/null << EOF
-# Odoo优化设置
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-vm.dirty_ratio = 10
-vm.dirty_background_ratio = 5
-vm.overcommit_memory = 1
-
-# 网络优化
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 262144
-net.core.rmem_default = 8388608
-net.core.rmem_max = 16777216
-net.core.wmem_default = 8388608
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_mem = 8388608 12582912 16777216
-net.ipv4.tcp_max_syn_backlog = 262144
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_max_tw_buckets = 6000000
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.ip_local_port_range = 1024 65535
-
-# 文件系统优化
-fs.file-max = 2097152
-fs.nr_open = 2097152
-EOF
-    
-    # 应用sysctl配置
-    sudo sysctl -p /etc/sysctl.d/99-odoo-optimization.conf
-    
-    # 创建limits优化配置
-    sudo tee /etc/security/limits.d/99-odoo.conf > /dev/null << EOF
-* soft nofile 65535
-* hard nofile 65535
-* soft nproc 65535
-* hard nproc 65535
-root soft nofile 65535
-root hard nofile 65535
-EOF
-    
-    # 创建systemd服务优化配置
-    if [ -f /etc/systemd/system.conf ]; then
-        sudo sed -i 's/^#DefaultLimitNOFILE=/DefaultLimitNOFILE=65535/' /etc/systemd/system.conf
-        sudo sed -i 's/^#DefaultLimitNPROC=/DefaultLimitNPROC=65535/' /etc/systemd/system.conf
-    fi
-    
-    log "系统参数优化完成"
-}
-
-# 智能配置Docker镜像源
-optimize_docker() {
-    log "配置Docker镜像源..."
-    
-    # 备份原有配置
-    if [ -f /etc/docker/daemon.json ]; then
-        sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
-    fi
-    
-    # 创建基本的Docker配置
-    local docker_config='{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "storage-driver": "overlay2",
-  "storage-opts": [
-    "overlay2.override_kernel_check=true"
-  ],
-  "live-restore": true,
-  "default-ulimits": {
-    "nofile": {
-      "Name": "nofile",
-      "Hard": 65535,
-      "Soft": 65535
-    },
-    "nproc": {
-      "Name": "nproc",
-      "Hard": 65535,
-      "Soft": 65535
-    }
-  },
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "log-level": "warn",
-  "dns": ["8.8.8.8", "8.8.4.4"]
-}'
-    
-    # 智能添加镜像源
-    local registry_mirrors='[]'
-    
-    # 检查网络连通性
-    check_network_connectivity
-    
-    # 如果Docker官方源不可用，则添加国内镜像源
-    if [ "$USE_DOCKER_HUB" = false ]; then
-        log "Docker官方源不可达，添加国内镜像源"
-        registry_mirrors='[
-    "https://docker.mirrors.ustc.edu.cn",
-    "https://hub-mirror.c.163.com",
-    "https://mirror.baidubce.com",
-    "https://registry.docker-cn.com"
-  ]'
-    else
-        log "Docker官方源可用，使用官方源"
-    fi
-    
-    # 如果有阿里云源且可用，添加到镜像源
-    if [ "$ALIYUN_AVAILABLE" = true ]; then
-        log "添加阿里云镜像源"
-        # 从阿里云镜像源字符串中移除末尾的逗号
-        registry_mirrors=$(echo "$registry_mirrors" | sed 's/\]$//')
-        if [ "$registry_mirrors" = "[" ]; then
-            registry_mirrors='[
-    "https://registry.cn-hangzhou.aliyuncs.com"
-  ]'
-        else
-            registry_mirrors=$(echo "$registry_mirrors" | sed 's/$/,\n    "https:\/\/registry.cn-hangzhou.aliyuncs.com"\n  ]/')
-        fi
-    fi
-    
-    # 创建完整的Docker配置
-    local final_config=$(echo "$docker_config" | sed "s/\"dns\": \[.*\]/\"dns\": [\"8.8.8.8\", \"8.8.4.4\"],\n  \"registry-mirrors\": $registry_mirrors/")
-    
-    # 写入配置
-    echo "$final_config" | sudo tee /etc/docker/daemon.json > /dev/null
-    
-    # 重启Docker
-    sudo systemctl restart docker
-    
-    # 测试Docker镜像源
-    log "测试Docker镜像源..."
-    if sudo docker pull hello-world >/dev/null 2>&1; then
-        log "Docker镜像源配置成功"
-        sudo docker rmi hello-world >/dev/null 2>&1 || true
-    else
-        log_warn "Docker镜像源测试失败，可能需要手动配置"
-    fi
-    
-    log "Docker配置完成"
 }
 
 # 配置Nginx
@@ -568,10 +282,10 @@ configure_nginx() {
     log "配置Nginx..."
     
     # 备份原始配置
-    sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
     
     # 创建优化的nginx配置
-    sudo tee /etc/nginx/nginx.conf > /dev/null << EOF
+    tee /etc/nginx/nginx.conf > /dev/null << EOF
 user www-data;
 worker_processes auto;
 pid /run/nginx.pid;
@@ -608,12 +322,6 @@ http {
     client_max_body_size 100M;
     client_body_timeout 120s;
     
-    # 缓存设置
-    open_file_cache max=1000 inactive=20s;
-    open_file_cache_valid 30s;
-    open_file_cache_min_uses 2;
-    open_file_cache_errors on;
-    
     # Gzip压缩
     gzip on;
     gzip_vary on;
@@ -646,529 +354,206 @@ http {
 EOF
     
     # 创建站点目录
-    sudo mkdir -p /etc/nginx/sites-available
-    sudo mkdir -p /etc/nginx/sites-enabled
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
     
     # 测试配置
-    sudo nginx -t
+    nginx -t
     
     # 重启Nginx
-    sudo systemctl restart nginx
+    systemctl restart nginx
     
     log "Nginx配置完成"
 }
 
-# 检查端口是否可用
-check_port() {
-    local port="$1"
-    if sudo ss -tuln | grep -q ":$port "; then
-        return 1
-    fi
-    return 0
-}
-
-# 生成实例名称（从域名或本地）
-generate_instance_name() {
-    local input="$1"
-    local deployment_type="$2"
+# 创建Docker卷
+create_docker_volumes() {
+    log "创建Docker卷..."
     
-    if [ "$deployment_type" = "domain" ]; then
-        # 域名模式：从域名生成
-        local domain="$input"
-        # 移除协议前缀
-        domain=$(echo "$domain" | sed -e 's|^[^/]*//||' -e 's|/.*$||')
-        # 替换点为减号，移除非法字符
-        local instance_name=$(echo "$domain" | sed 's/[^a-zA-Z0-9.-]/-/g' | sed 's/\./-/g')
-        echo "$instance_name"
+    if ! docker volume ls | grep -q "$DB_VOLUME_NAME"; then
+        docker volume create "$DB_VOLUME_NAME"
+        log "创建数据库卷: $DB_VOLUME_NAME"
     else
-        # 本地模式：使用输入的实例名称
-        # 替换非法字符
-        local instance_name=$(echo "$input" | sed 's/[^a-zA-Z0-9.-]/-/g')
-        echo "$instance_name"
+        log "数据库卷已存在: $DB_VOLUME_NAME"
     fi
+    
+    if ! docker volume ls | grep -q "$ODOO_VOLUME_NAME"; then
+        docker volume create "$ODOO_VOLUME_NAME"
+        log "创建Odoo文件卷: $ODOO_VOLUME_NAME"
+    else
+        log "Odoo文件卷已存在: $ODOO_VOLUME_NAME"
+    fi
+    
+    log "Docker卷创建完成"
 }
 
-# 选择Odoo镜像
-select_odoo_image() {
-    echo "选择Odoo版本:"
-    echo "1) Trade Odoo 17 (registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest)"
-    echo "2) Odoo 18 (odoo:18.0)"
-    echo "3) Odoo 19 (odoo:19.0)"
-    echo "4) 自定义镜像"
-    
-    read -p "选择 (1-4) [默认: 1]: " version_choice
-    version_choice=${version_choice:-1}
-    
-    case $version_choice in
-        1)
-            ODOO_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest"
-            POSTGRES_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/postgres:latest"
-            ODOO_VERSION="17.0-Trade"
-            log "选择 Trade Odoo 17"
-            log "  Odoo镜像: $ODOO_IMAGE"
-            log "  PostgreSQL镜像: $POSTGRES_IMAGE"
-            ;;
-        2)
-            ODOO_IMAGE="odoo:18.0"
-            POSTGRES_IMAGE="postgres:15"
-            ODOO_VERSION="18.0"
-            ;;
-        3)
-            ODOO_IMAGE="odoo:19.0"
-            POSTGRES_IMAGE="postgres:15"
-            ODOO_VERSION="19.0"
-            ;;
-        4)
-            read -p "输入自定义Odoo镜像 (例如: odoo:17.0-custom): " custom_image
-            if [[ -z "$custom_image" ]]; then
-                log_error "镜像不能为空"
-                return 1
-            fi
-            ODOO_IMAGE="$custom_image"
-            POSTGRES_IMAGE="postgres:15"
-            
-            # 尝试从镜像名称提取版本
-            if [[ "$custom_image" == *"17"* ]]; then
-                ODOO_VERSION="17.0"
-            elif [[ "$custom_image" == *"18"* ]]; then
-                ODOO_VERSION="18.0"
-            elif [[ "$custom_image" == *"19"* ]]; then
-                ODOO_VERSION="19.0"
-            else
-                ODOO_VERSION="custom"
-            fi
-            ;;
-        *)
-            log_error "无效选择"
-            return 1
-            ;;
-    esac
-    
-    log "选择的Odoo镜像: $ODOO_IMAGE"
-    log "选择的PostgreSQL镜像: $POSTGRES_IMAGE"
-    return 0
-}
-
-# 获取Docker镜像（智能选择镜像源）
+# 拉取Docker镜像
 get_docker_image() {
     local image_name="$1"
-    local image_type="$2"  # odoo 或 postgres
     
     log "拉取Docker镜像: $image_name"
     
     # 先尝试直接拉取
-    if sudo docker pull "$image_name" >/dev/null 2>&1; then
+    if docker pull "$image_name" >/dev/null 2>&1; then
         log "镜像拉取成功: $image_name"
         return 0
     fi
     
-    # 如果拉取失败，尝试使用备用镜像源
     log_warn "镜像拉取失败，尝试使用备用源..."
     
-    # 根据镜像类型选择备用源
-    if [ "$image_type" = "odoo" ]; then
-        # Odoo镜像备用源
-        local backup_images=(
-            "odoo:19.0"
-            "odoo:18.0"
-            "registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest"
-        )
-    else
-        # PostgreSQL镜像备用源
-        local backup_images=(
-            "postgres:15"
-            "registry.cn-hangzhou.aliyuncs.com/morhon_hub/postgres:latest"
-        )
+    # 尝试官方镜像源
+    if [[ "$image_name" == *"morhon_hub"* ]]; then
+        # 如果是茂亨镜像，尝试不同标签
+        local backup_image="morhon_hub/mh_odoosaas_v17:latest"
+        log "尝试备用镜像: $backup_image"
+        if docker pull "$backup_image" >/dev/null 2>&1; then
+            log "备用镜像拉取成功: $backup_image"
+            docker tag "$backup_image" "$image_name"
+            return 0
+        fi
     fi
     
-    # 尝试备用镜像
-    for backup_image in "${backup_images[@]}"; do
-        if [ "$backup_image" != "$image_name" ]; then
-            log "尝试备用镜像: $backup_image"
-            if sudo docker pull "$backup_image" >/dev/null 2>&1; then
-                log "备用镜像拉取成功: $backup_image"
-                # 重命名镜像以便使用
-                sudo docker tag "$backup_image" "$image_name"
-                return 0
-            fi
-        fi
-    done
-    
-    log_error "无法拉取镜像，请检查网络连接或手动拉取镜像"
+    log_error "无法拉取镜像，请检查网络连接"
     return 1
 }
 
 # 生成docker-compose文件
 generate_docker_compose() {
-    local instance_name="$1"
-    local deployment_type="$2"  # domain 或 local
-    local domain="$3"
-    local use_www="$4"
-    local odoo_image="$5"
-    local postgres_image="$6"
-    local odoo_version="$7"
-    local port="$8"
-    local allow_ip_access="$9"
+    local deployment_type="$1"  # domain 或 local
+    local domain="$2"
+    local use_www="${3:-no}"
     
-    local instance_dir="$INSTANCES_BASE/$instance_name"
+    # 获取系统信息用于优化
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    
+    # 计算workers数量
+    local workers=4
+    [ $cpu_cores -ge 8 ] && workers=8
+    [ $cpu_cores -ge 4 ] && workers=6
+    [ $cpu_cores -ge 2 ] && workers=4
+    [ $cpu_cores -eq 1 ] && workers=2
     
     # 创建目录结构
-    mkdir -p "$instance_dir/addons"
-    mkdir -p "$instance_dir/config"
-    mkdir -p "$instance_dir/data"
-    mkdir -p "$instance_dir/postgres_data"
-    mkdir -p "$instance_dir/backups"
-    mkdir -p "$instance_dir/logs/odoo"
-    mkdir -p "$instance_dir/logs/postgres"
-    
-    # 创建字体目录并复制字体
-    mkdir -p "$instance_dir/fonts"
-    sudo cp /usr/share/fonts/truetype/custom/* "$instance_dir/fonts/" 2>/dev/null || true
-    sudo cp /usr/share/fonts/truetype/wqy/* "$instance_dir/fonts/" 2>/dev/null || true
+    mkdir -p "$INSTANCE_DIR/config"
+    mkdir -p "$INSTANCE_DIR/backups"
+    mkdir -p "$INSTANCE_DIR/logs"
     
     # 创建odoo配置文件
-    cat > "$instance_dir/config/odoo.conf" << EOF
+    cat > "$INSTANCE_DIR/config/odoo.conf" << EOF
 [options]
-; 数据库设置
-db_host = db
-db_port = 5432
-db_user = odoo
-db_password = \${DB_PASSWORD}
-db_name = odoo_${instance_name}
-db_template = template0
-dbfilter = ^odoo_${instance_name}\$
-list_db = False
-
-; 安全设置
 admin_passwd = \${ADMIN_PASSWORD}
-proxy_mode = True
-without_demo = all
-x_sendfile = True
-
-; 性能优化
-workers = ${WORKERS}
-max_cron_threads = ${MAX_CRON_THREADS}
-limit_memory_hard = ${LIMIT_MEMORY_HARD}
-limit_memory_soft = ${LIMIT_MEMORY_SOFT}
-limit_time_cpu = 900
-limit_time_real = 1800
-limit_request = 8192
-
-; 日志设置
-logfile = /var/log/odoo/odoo.log
-log_level = warn
-log_handler = :INFO
-log_db = False
-log_db_level = warning
-
-; 邮件设置
-email_from = odoo@${domain:-localhost}
-smtp_server = localhost
-smtp_port = 25
-smtp_ssl = False
-
-; PDF设置（解决中文显示问题）
-pdfkit_path = /usr/bin/wkhtmltopdf
-reportgz = False
-
-; 缓存设置
-proxy_mode = True
-server_wide_modules = base,web
-
-; 其他设置
-data_dir = /var/lib/odoo
 addons_path = /mnt/extra-addons,/mnt/odoo/addons
+data_dir = /var/lib/odoo
+without_demo = all
+proxy_mode = True
+workers = $workers
+limit_memory_hard = $((total_mem * 256))M
+limit_memory_soft = $((total_mem * 192))M
+max_cron_threads = $((workers / 2))
+db_name = postgres
+list_db = False
 EOF
-    
-    # 创建PostgreSQL优化配置
-    cat > "$instance_dir/config/postgresql.conf" << EOF
-# PostgreSQL优化配置
-listen_addresses = '*'
-max_connections = 100
-shared_buffers = ${DB_SHARED_BUFFERS}
-effective_cache_size = ${DB_EFFECTIVE_CACHE_SIZE}
-maintenance_work_mem = ${DB_MAINTENANCE_WORK_MEM}
-checkpoint_completion_target = 0.9
-wal_buffers = 16MB
-default_statistics_target = 100
-random_page_cost = 1.1
-effective_io_concurrency = 200
-work_mem = ${DB_WORK_MEM}
-min_wal_size = 1GB
-max_wal_size = 4GB
-max_worker_processes = ${CPU_CORES}
-max_parallel_workers_per_gather = ${CPU_CORES}
-max_parallel_workers = ${CPU_CORES}
-log_destination = 'stderr'
-logging_collector = on
-log_directory = '/var/log/postgresql'
-log_filename = 'postgresql-%Y-%m%d_%H%M%S.log'
-log_truncate_on_rotation = on
-log_rotation_age = 1d
-log_rotation_size = 10MB
-log_min_duration_statement = 1000
-log_checkpoints = on
-log_connections = on
-log_disconnections = on
-log_lock_waits = on
-log_temp_files = 0
-log_autovacuum_min_duration = 0
-EOF
-    
-    # 根据部署类型配置端口绑定
-    local port_binding
-    if [ "$allow_ip_access" = "yes" ] && [ "$deployment_type" = "local" ]; then
-        # 本地部署且允许IP访问：绑定到所有接口
-        port_binding="\"${port}:8069\""
-    else
-        # 域名部署或不允许IP访问：仅绑定到本地
-        port_binding="\"127.0.0.1:${port}:8069\""
-    fi
     
     # 创建docker-compose.yml
-    cat > "$instance_dir/docker-compose.yml" << EOF
+    cat > "$INSTANCE_DIR/docker-compose.yml" << EOF
 version: '3.8'
 
 services:
   db:
-    image: ${postgres_image}
-    container_name: ${instance_name}-db
+    image: $POSTGRES_IMAGE
+    container_name: morhon-odoo-db
     restart: always
     environment:
-      POSTGRES_DB: odoo_${instance_name}
+      POSTGRES_DB: postgres
       POSTGRES_USER: odoo
       POSTGRES_PASSWORD: \${DB_PASSWORD}
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - ${instance_dir}/postgres_data:/var/lib/postgresql/data/pgdata
-      - ${instance_dir}/config/postgresql.conf:/etc/postgresql/postgresql.conf
-      - ${instance_dir}/backups:/backups
-      - ${instance_dir}/logs/postgres:/var/log/postgresql
-    command: >
-      postgres 
-      -c config_file=/etc/postgresql/postgresql.conf
-      -c shared_preload_libraries='pg_stat_statements'
+      - $DB_VOLUME_NAME:/var/lib/postgresql/data/pgdata
+      - $INSTANCE_DIR/backups:/backups
     networks:
-      - odoo-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U odoo"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: '${CPU_LIMIT}'
-          memory: ${LIMIT_MEMORY_HARD}
-        reservations:
-          memory: ${LIMIT_MEMORY_SOFT}
+      - morhon-network
 
   odoo:
-    image: ${odoo_image}
-    container_name: ${instance_name}-odoo
+    image: $ODOO_IMAGE
+    container_name: morhon-odoo
     restart: always
     depends_on:
-      db:
-        condition: service_healthy
+      - db
     environment:
       HOST: db
       PORT: 5432
       USER: odoo
       PASSWORD: \${DB_PASSWORD}
-      DB_NAME: odoo_${instance_name}
+      DB_NAME: postgres
       ADMIN_PASSWORD: \${ADMIN_PASSWORD}
-    ports:
-      - ${port_binding}
     volumes:
-      - ${instance_dir}/config/odoo.conf:/etc/odoo/odoo.conf
-      - ${instance_dir}/addons:/mnt/extra-addons
-      - ${instance_dir}/data:/var/lib/odoo
-      - ${instance_dir}/logs/odoo:/var/log/odoo
-      - ${instance_dir}/fonts:/usr/share/fonts/truetype/custom
+      - $INSTANCE_DIR/config/odoo.conf:/etc/odoo/odoo.conf
+      - $ODOO_VOLUME_NAME:/var/lib/odoo
+      - $INSTANCE_DIR/logs:/var/log/odoo
+    ports:
+      - "127.0.0.1:8069:8069"
+      - "127.0.0.1:8072:8072"
     networks:
-      - odoo-network
-    command: >
-      odoo
-      --config=/etc/odoo/odoo.conf
-      --update=all
-      --without-demo=all
-      --db-filter=^odoo_${instance_name}\$
-    deploy:
-      resources:
-        limits:
-          cpus: '${CPU_LIMIT}'
-          memory: ${LIMIT_MEMORY_HARD}
-        reservations:
-          memory: ${LIMIT_MEMORY_SOFT}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8069/web/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      - morhon-network
 
 networks:
-  odoo-network:
+  morhon-network:
+    external: false
+    name: morhon-network
+
+volumes:
+  $DB_VOLUME_NAME:
     external: true
-    name: ${DOCKER_NETWORK}
+  $ODOO_VOLUME_NAME:
+    external: true
 EOF
     
     # 创建环境变量文件
-    cat > "$instance_dir/.env" << EOF
-# Odoo实例环境变量
-# 实例: ${instance_name}
-# 部署类型: ${deployment_type}
-# 域名: ${domain:-无}
-# 使用WWW: ${use_www:-无}
-# Odoo镜像: ${odoo_image}
-# PostgreSQL镜像: ${postgres_image}
-# 版本: ${odoo_version}
-# 端口: ${port}
-# 允许IP访问: ${allow_ip_access}
-# 部署时间: $(date '+%Y-%m-%d %H:%M:%S')
-
-# 数据库设置
-DB_PASSWORD=$(openssl rand -base64 32)
+    local db_password="${DETECTED_DB_PASSWORD:-$(openssl rand -base64 32)}"
+    cat > "$INSTANCE_DIR/.env" << EOF
+# 茂亨Odoo环境变量
+DB_PASSWORD=$db_password
 ADMIN_PASSWORD=$(openssl rand -base64 24)
-
-# 实例信息
-INSTANCE_NAME=${instance_name}
-DEPLOYMENT_TYPE=${deployment_type}
-DOMAIN=${domain}
-USE_WWW=${use_www}
-ODOO_IMAGE=${odoo_image}
-POSTGRES_IMAGE=${postgres_image}
-ODOO_VERSION=${odoo_version}
-PORT=${port}
-ALLOW_IP_ACCESS=${allow_ip_access}
-
-# 系统优化参数
-CPU_CORES=${CPU_CORES}
-TOTAL_MEM=${TOTAL_MEM}GB
-WORKERS=${WORKERS}
-MAX_CRON_THREADS=${MAX_CRON_THREADS}
-LIMIT_MEMORY_HARD=${LIMIT_MEMORY_HARD}
-LIMIT_MEMORY_SOFT=${LIMIT_MEMORY_SOFT}
-CPU_LIMIT=${CPU_LIMIT}
+DEPLOYMENT_TYPE=$deployment_type
+DOMAIN=$domain
+USE_WWW=$use_www
 EOF
     
     # 根据部署类型创建Nginx配置
     if [ "$deployment_type" = "domain" ]; then
-        # 域名模式：创建Nginx站点配置
-        create_nginx_site_config "$instance_name" "$domain" "$use_www" "$port" "$allow_ip_access"
-    elif [ "$deployment_type" = "local" ] && [ "$allow_ip_access" = "no" ]; then
-        # 本地模式但不允许IP访问：创建Nginx反向代理配置
-        create_local_nginx_config "$instance_name" "$port"
+        create_nginx_domain_config "$domain" "$use_www"
+    else
+        create_nginx_local_config
     fi
     
-    # 设置目录权限
-    CURRENT_USER=$(whoami)
-    sudo chown -R $CURRENT_USER:$CURRENT_USER "$instance_dir"
-    
-    # 但数据库目录需要特定权限
-    sudo chown -R 999:999 "$instance_dir/postgres_data" 2>/dev/null || true
-    
-    # 创建数据库初始化脚本
-    cat > "$instance_dir/init-db.sh" << EOF
-#!/bin/bash
-# 数据库初始化脚本
-docker exec -i ${instance_name}-db psql -U odoo -d odoo_${instance_name} << EOSQL
--- 创建pg_stat_statements扩展
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- 创建监控用户
-CREATE USER monitor WITH PASSWORD '$(openssl rand -base64 16)';
-GRANT pg_monitor TO monitor;
-
--- 创建备份用户
-CREATE USER backup WITH PASSWORD '$(openssl rand -base64 16)';
-GRANT CONNECT ON DATABASE odoo_${instance_name} TO backup;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO backup;
-
--- 优化数据库配置
-ALTER DATABASE odoo_${instance_name} SET random_page_cost = 1.1;
-ALTER DATABASE odoo_${instance_name} SET effective_io_concurrency = 200;
-ALTER DATABASE odoo_${instance_name} SET maintenance_work_mem = '${DB_MAINTENANCE_WORK_MEM}';
-ALTER DATABASE odoo_${instance_name} SET work_mem = '${DB_WORK_MEM}';
-EOSQL
-EOF
-    
-    chmod +x "$instance_dir/init-db.sh"
-    
-    # 创建数据库备份脚本
-    cat > "$instance_dir/backup-db.sh" << EOF
-#!/bin/bash
-# 数据库备份脚本
-BACKUP_DIR="${instance_dir}/backups"
-BACKUP_FILE="odoo_${instance_name}_\$(date +%Y%m%d_%H%M%S).sql.gz"
-docker exec ${instance_name}-db pg_dump -U odoo odoo_${instance_name} | gzip > "\$BACKUP_DIR/\$BACKUP_FILE"
-find "\$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
-echo "备份完成: \$BACKUP_FILE"
-EOF
-    
-    chmod +x "$instance_dir/backup-db.sh"
-    
-    # 创建日志清理脚本
-    cat > "$instance_dir/clean-logs.sh" << EOF
-#!/bin/bash
-# 日志清理脚本
-find "${instance_dir}/logs" -name "*.log" -type f -mtime +30 -delete
-find "${instance_dir}/logs" -name "*.log.*" -type f -mtime +7 -delete
-docker exec ${instance_name}-odoo find /var/log/odoo -name "*.log.*" -type f -mtime +7 -delete
-echo "日志清理完成"
-EOF
-    
-    chmod +x "$instance_dir/clean-logs.sh"
-    
-    # 创建重启脚本
-    cat > "$instance_dir/restart.sh" << EOF
-#!/bin/bash
-# 重启脚本
-cd "$instance_dir"
-docker-compose restart
-echo "实例已重启"
-EOF
-    
-    chmod +x "$instance_dir/restart.sh"
-    
-    log "为实例 $instance_name 生成配置文件"
+    log "配置文件生成完成"
 }
 
-# 创建Nginx站点配置（域名模式）
-create_nginx_site_config() {
-    local instance_name="$1"
-    local domain="$2"
-    local use_www="$3"
-    local port="$4"
-    local allow_ip_access="$5"
+# 创建Nginx域名配置
+create_nginx_domain_config() {
+    local domain="$1"
+    local use_www="$2"
     
-    local config_file="/etc/nginx/sites-available/${instance_name}"
+    local config_file="/etc/nginx/sites-available/morhon-odoo"
     
     # 根据是否使用www生成server_name
     local server_name
     if [ "$use_www" = "yes" ]; then
-        server_name="${domain} www.${domain}"
+        server_name="$domain www.$domain"
     else
-        server_name="${domain}"
+        server_name="$domain"
     fi
     
-    sudo tee "$config_file" > /dev/null << EOF
-# Odoo实例: ${instance_name}
-# 域名: ${domain}
-# 使用WWW: ${use_www}
+    tee "$config_file" > /dev/null << EOF
+# 茂亨Odoo域名模式 - $domain
 
 # HTTP重定向到HTTPS
 server {
     listen 80;
     listen [::]:80;
-    server_name ${server_name};
-    
-    # 安全头部
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    server_name $server_name;
     
     # Certbot验证
     location /.well-known/acme-challenge/ {
@@ -1179,186 +564,39 @@ server {
     location / {
         return 301 https://\$server_name\$request_uri;
     }
-    
-    access_log /var/log/nginx/${instance_name}-access.log;
-    error_log /var/log/nginx/${instance_name}-error.log;
 }
 
 # HTTPS服务器
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name ${server_name};
+    server_name $server_name;
     
-    # SSL证书
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    
-    # SSL优化
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    ssl_trusted_certificate /etc/letsencrypt/live/${domain}/chain.pem;
-    resolver 8.8.8.8 8.8.4.4 valid=300s;
-    resolver_timeout 5s;
+    # SSL证书（Certbot会自动配置）
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
     
     # 安全头部
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Content-Security-Policy "default-src 'self' https: data: 'unsafe-inline' 'unsafe-eval';" always;
     
     # 代理设置
-    proxy_connect_timeout 600s;
-    proxy_send_timeout 600s;
-    proxy_read_timeout 600s;
-    proxy_buffers 16 64k;
-    proxy_buffer_size 128k;
-    
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header Host \$host;
     
-    # 禁止访问敏感路径
+    # 禁止访问数据库管理界面
     location ~* /(web|api)/database/ {
-        deny all;
-        return 403;
-    }
-    
-    location ~* /web/database/manager {
-        deny all;
-        return 403;
-    }
-    
-    location ~* /(README|CHANGELOG|COPYING|LICENSE|\.git) {
-        deny all;
-        return 403;
-    }
-    
-    # 禁止通过IP访问（如果配置了不允许IP访问）
-    if (\$host !~* ^(${domain}|www\.${domain})\$ ) {
-        return 444;
-    }
-    
-    # 长轮询请求
-    location /longpolling {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-    
-    # 静态文件 - 带缓存
-    location ~* /web/static/ {
-        proxy_cache_valid 200 60m;
-        proxy_cache_valid 404 1m;
-        proxy_buffering on;
-        expires 864000;
-        proxy_pass http://127.0.0.1:${port};
-        
-        # 缓存配置
-        proxy_cache static_cache;
-        proxy_cache_key \$scheme\$proxy_host\$request_uri;
-        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
-        proxy_cache_background_update on;
-        proxy_cache_lock on;
-        add_header X-Cache-Status \$upstream_cache_status;
-    }
-    
-    # WebSocket支持
-    location /websocket {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-    
-    # 主请求
-    location / {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_redirect off;
-        proxy_buffering off;
-    }
-    
-    # 错误页面
-    error_page 500 502 503 504 /50x.html;
-    location = /50x.html {
-        root /usr/share/nginx/html;
-    }
-    
-    access_log /var/log/nginx/${instance_name}-ssl-access.log;
-    error_log /var/log/nginx/${instance_name}-ssl-error.log;
-}
-EOF
-    
-    # 启用站点
-    sudo ln -sf "$config_file" "/etc/nginx/sites-enabled/"
-    
-    log "Nginx站点配置创建完成: $config_file"
-}
-
-# 创建本地Nginx配置（本地模式，不允许IP直接访问）
-create_local_nginx_config() {
-    local instance_name="$1"
-    local port="$2"
-    
-    local config_file="/etc/nginx/sites-available/${instance_name}"
-    
-    sudo tee "$config_file" > /dev/null << EOF
-# Odoo实例: ${instance_name}
-# 本地部署模式
-# 访问方式: 通过Nginx代理，不能直接通过IP:端口访问
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name _;  # 匹配所有域名
-    
-    # 安全头部
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    
-    # 代理设置
-    proxy_connect_timeout 600s;
-    proxy_send_timeout 600s;
-    proxy_read_timeout 600s;
-    proxy_buffers 16 64k;
-    proxy_buffer_size 128k;
-    
-    proxy_set_header X-Forwarded-Host \$host;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header Host \$host;
-    
-    # 禁止访问敏感路径
-    location ~* /(web|api)/database/ {
-        deny all;
-        return 403;
-    }
-    
-    location ~* /web/database/manager {
-        deny all;
-        return 403;
-    }
-    
-    location ~* /(README|CHANGELOG|COPYING|LICENSE|\.git) {
         deny all;
         return 403;
     }
     
     # 长轮询请求
     location /longpolling {
-        proxy_pass http://127.0.0.1:${port};
+        proxy_pass http://127.0.0.1:8072;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -1368,32 +606,88 @@ server {
     location ~* /web/static/ {
         proxy_buffering on;
         expires 864000;
-        proxy_pass http://127.0.0.1:${port};
+        proxy_pass http://127.0.0.1:8069;
     }
     
     # 主请求
     location / {
-        proxy_pass http://127.0.0.1:${port};
+        proxy_pass http://127.0.0.1:8069;
         proxy_redirect off;
-        proxy_buffering off;
     }
     
-    # 错误页面
-    error_page 500 502 503 504 /50x.html;
-    location = /50x.html {
-        root /usr/share/nginx/html;
-    }
-    
-    access_log /var/log/nginx/${instance_name}-access.log;
-    error_log /var/log/nginx/${instance_name}-error.log;
+    access_log /var/log/nginx/morhon-odoo-access.log;
+    error_log /var/log/nginx/morhon-odoo-error.log;
 }
 EOF
     
     # 启用站点
-    sudo ln -sf "$config_file" "/etc/nginx/sites-enabled/"
+    ln -sf "$config_file" "/etc/nginx/sites-enabled/"
+    rm -f /etc/nginx/sites-enabled/default
     
-    log "本地Nginx配置创建完成: $config_file"
-    log "实例将通过Nginx代理访问，不能直接通过IP:端口访问"
+    log "Nginx域名配置创建完成"
+}
+
+# 创建Nginx本地配置
+create_nginx_local_config() {
+    local config_file="/etc/nginx/sites-available/morhon-odoo"
+    local server_ip=$(get_server_ip)
+    
+    tee "$config_file" > /dev/null << EOF
+# 茂亨Odoo本地模式 - 通过IP访问
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    
+    # 安全头部
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # 代理设置
+    proxy_set_header X-Forwarded-Host \$host;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Real-IP \$remote_addr;
+    
+    # 禁止访问数据库管理界面
+    location ~* /(web|api)/database/ {
+        deny all;
+        return 403;
+    }
+    
+    # 长轮询请求
+    location /longpolling {
+        proxy_pass http://127.0.0.1:8072;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    
+    # 静态文件
+    location ~* /web/static/ {
+        proxy_buffering on;
+        expires 864000;
+        proxy_pass http://127.0.0.1:8069;
+    }
+    
+    # 主请求
+    location / {
+        proxy_pass http://127.0.0.1:8069;
+        proxy_redirect off;
+    }
+    
+    access_log /var/log/nginx/morhon-odoo-access.log;
+    error_log /var/log/nginx/morhon-odoo-error.log;
+}
+EOF
+    
+    # 启用站点
+    ln -sf "$config_file" "/etc/nginx/sites-enabled/"
+    rm -f /etc/nginx/sites-enabled/default
+    
+    log "Nginx本地配置创建完成"
+    log "将通过IP地址访问: http://$server_ip"
 }
 
 # 获取SSL证书
@@ -1404,1257 +698,597 @@ get_ssl_certificate() {
     log "获取SSL证书..."
     
     # 创建Certbot目录
-    sudo mkdir -p /var/www/certbot
+    mkdir -p /var/www/certbot
     
     # 根据是否使用www生成域名列表
     local domains
     if [ "$use_www" = "yes" ]; then
-        domains="-d $domain -d www.$domain"
+        domains="$domain www.$domain"
     else
-        domains="-d $domain"
+        domains="$domain"
     fi
     
-    # 使用临时配置获取证书
-    if sudo certbot certonly --webroot \
+    # 临时配置Nginx用于验证
+    local temp_config="/etc/nginx/sites-available/certbot-temp"
+    tee "$temp_config" > /dev/null << EOF
+server {
+    listen 80;
+    server_name $domains;
+    
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+    
+    location / {
+        return 404;
+    }
+}
+EOF
+    
+    ln -sf "$temp_config" "/etc/nginx/sites-enabled/certbot-temp"
+    systemctl reload nginx
+    
+    # 获取证书
+    if certbot certonly --webroot \
         -w /var/www/certbot \
-        $domains \
+        -d $domains \
         --non-interactive \
         --agree-tos \
-        --email "admin@$domain"; then
+        --email "admin@$domain" \
+        --force-renewal; then
         log "SSL证书获取成功"
+        # 清理临时配置
+        rm -f /etc/nginx/sites-enabled/certbot-temp
+        rm -f "$temp_config"
         return 0
     else
-        log_warn "无法获取SSL证书，将继续使用HTTP"
+        log_warn "无法获取SSL证书，将使用HTTP"
+        # 清理临时配置
+        rm -f /etc/nginx/sites-enabled/certbot-temp
+        rm -f "$temp_config"
         return 1
     fi
 }
 
-# 部署Odoo实例
-deploy_odoo() {
-    log "开始部署Odoo实例..."
+# 迁移手动部署实例到脚本管理
+migrate_manual_instance() {
+    log "开始迁移手动部署实例..."
     
-    # 获取系统信息
-    get_system_info
-    
-    # 选择部署模式
-    echo "选择部署模式:"
-    echo "1) 域名模式 (需要域名，配置HTTPS)"
-    echo "2) 本地模式 (无需域名，通过IP访问)"
-    
-    read -p "选择部署模式 (1-2) [默认: 1]: " deployment_choice
-    deployment_choice=${deployment_choice:-1}
-    
-    case $deployment_choice in
-        1)
-            deployment_type="domain"
-            log "选择域名部署模式"
-            
-            # 输入域名
-            read -p "输入域名（例如: example.com）: " domain
-            
-            if [[ -z "$domain" ]]; then
-                log_error "域名不能为空"
-                return 1
-            fi
-            
-            # 询问是否使用www
-            read -p "是否使用www前缀？(y/N): " use_www_choice
-            if [[ "$use_www_choice" =~ ^[Yy]$ ]]; then
-                use_www="yes"
-                log "将同时支持 www.$domain 和 $domain"
-            else
-                use_www="no"
-                log "将仅支持 $domain"
-            fi
-            
-            # 询问是否允许通过IP访问
-            read -p "是否允许通过IP地址直接访问？(y/N): " allow_ip_choice
-            if [[ "$allow_ip_choice" =~ ^[Yy]$ ]]; then
-                allow_ip_access="yes"
-                log_warn "允许通过IP地址直接访问（安全风险警告）"
-            else
-                allow_ip_access="no"
-                log "禁止通过IP地址直接访问，只能通过域名访问"
-            fi
-            
-            # 生成实例名称
-            instance_name=$(generate_instance_name "$domain" "$deployment_type")
-            ;;
-        2)
-            deployment_type="local"
-            log "选择本地部署模式"
-            
-            # 输入实例名称
-            read -p "输入实例名称（例如: my-odoo）: " instance_input
-            
-            if [[ -z "$instance_input" ]]; then
-                log_error "实例名称不能为空"
-                return 1
-            fi
-            
-            # 询问是否允许通过IP访问
-            echo "本地部署模式访问方式:"
-            echo "1) 通过Nginx代理访问 (推荐，更安全)"
-            echo "2) 直接通过IP:端口访问 (简单，但安全性较低)"
-            read -p "选择访问方式 (1-2) [默认: 1]: " access_choice
-            access_choice=${access_choice:-1}
-            
-            if [ "$access_choice" = "1" ]; then
-                allow_ip_access="no"
-                log "选择通过Nginx代理访问"
-            else
-                allow_ip_access="yes"
-                log "选择直接通过IP:端口访问"
-            fi
-            
-            # 生成实例名称
-            instance_name=$(generate_instance_name "$instance_input" "$deployment_type")
-            
-            # 本地模式不需要域名和www
-            domain=""
-            use_www="no"
-            ;;
-        *)
-            log_error "无效选择"
-            return 1
-            ;;
-    esac
-    
-    # 检查实例是否已存在
-    if [ -d "$INSTANCES_BASE/$instance_name" ]; then
-        log_warn "实例 '$instance_name' 已存在"
-        read -p "是否要重新部署？这将删除现有数据！(y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            log "取消部署"
-            return 1
-        fi
-        # 停止并删除现有实例
-        cd "$INSTANCES_BASE/$instance_name" 2>/dev/null && docker-compose down -v 2>/dev/null || true
-        sudo rm -rf "$INSTANCES_BASE/$instance_name"
-        
-        # 删除Nginx配置
-        sudo rm -f "/etc/nginx/sites-available/$instance_name"
-        sudo rm -f "/etc/nginx/sites-enabled/$instance_name"
-    fi
-    
-    # 选择Odoo镜像
-    select_odoo_image
-    if [ $? -ne 0 ]; then
+    # 确认迁移
+    echo ""
+    echo -e "${YELLOW}迁移操作将执行以下步骤:${NC}"
+    echo "  1. 备份现有数据"
+    echo "  2. 停止并删除旧容器"
+    echo "  3. 创建脚本管理实例"
+    echo "  4. 恢复数据到新实例"
+    echo ""
+    read -p "是否继续？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log "取消迁移"
         return 1
     fi
     
-    # 检查端口
-    if [ "$deployment_type" = "domain" ]; then
-        default_port="8069"
-    else
-        default_port="8069"
+    # 备份现有数据
+    local backup_timestamp=$(date '+%Y%m%d_%H%M%S')
+    local backup_path="$BACKUP_DIR/migration_$backup_timestamp"
+    mkdir -p "$backup_path"
+    
+    log "备份现有数据..."
+    
+    # 备份数据库
+    if [ -n "$DETECTED_DB_CONTAINER" ]; then
+        docker exec "$DETECTED_DB_CONTAINER" pg_dumpall -U postgres | gzip > "$backup_path/database.sql.gz" 2>/dev/null || \
+        docker exec "$DETECTED_DB_CONTAINER" pg_dumpall -U odoo | gzip > "$backup_path/database.sql.gz" 2>/dev/null || \
+        log_warn "数据库备份失败"
     fi
     
-    read -p "输入HTTP端口 [默认: $default_port]: " port
-    port=${port:-$default_port}
+    # 询问部署模式
+    local deployment_type="local"
+    local domain=""
+    local use_www="no"
     
-    if ! check_port "$port"; then
-        log_error "端口 $port 已被占用"
-        read -p "是否自动分配可用端口？(Y/n): " auto_port
-        if [[ "$auto_port" =~ ^[Nn]$ ]]; then
-            return 1
+    if [ -n "$DETECTED_DOMAIN" ]; then
+        echo "检测到现有域名: $DETECTED_DOMAIN"
+        read -p "是否使用此域名？(Y/n): " use_domain
+        if [[ ! "$use_domain" =~ ^[Nn]$ ]]; then
+            deployment_type="domain"
+            domain="$DETECTED_DOMAIN"
+            
+            read -p "是否同时支持www.$domain？(y/N): " use_www_choice
+            [[ "$use_www_choice" =~ ^[Yy]$ ]] && use_www="yes"
         fi
-        
-        # 自动寻找可用端口
-        for p in {8070..8100}; do
-            if check_port "$p"; then
-                port="$p"
-                log "使用端口: $port"
-                break
-            fi
-        done
     fi
     
-    # 如果是本地模式且允许IP访问，需要开放防火墙端口
-    if [ "$deployment_type" = "local" ] && [ "$allow_ip_access" = "yes" ]; then
-        log "本地部署模式允许IP访问，开放防火墙端口 $port"
-        sudo ufw allow "$port/tcp"
+    # 如果没有域名，询问是否使用域名模式
+    if [ -z "$domain" ]; then
+        read -p "是否使用域名模式？(y/N): " use_domain
+        if [[ "$use_domain" =~ ^[Yy]$ ]]; then
+            deployment_type="domain"
+            read -p "请输入域名: " domain
+            [ -z "$domain" ] && deployment_type="local"
+        fi
     fi
     
-    log "开始部署 Odoo 实例..."
-    log "部署模式: $deployment_type"
+    # 停止并删除旧容器
+    log "清理旧容器..."
+    [ -n "$DETECTED_ODOO_CONTAINER" ] && docker stop "$DETECTED_ODOO_CONTAINER" 2>/dev/null || true
+    [ -n "$DETECTED_DB_CONTAINER" ] && docker stop "$DETECTED_DB_CONTAINER" 2>/dev/null || true
+    [ -n "$DETECTED_ODOO_CONTAINER" ] && docker rm "$DETECTED_ODOO_CONTAINER" 2>/dev/null || true
+    [ -n "$DETECTED_DB_CONTAINER" ] && docker rm "$DETECTED_DB_CONTAINER" 2>/dev/null || true
     
-    if [ "$deployment_type" = "domain" ]; then
-        log "域名: $domain"
-        log "使用WWW: $use_www"
-    fi
+    # 创建新的脚本管理实例
+    log "创建新实例..."
     
-    log "实例名称: $instance_name"
-    log "Odoo镜像: $ODOO_IMAGE"
-    log "PostgreSQL镜像: $POSTGRES_IMAGE"
-    log "端口: $port"
-    log "允许IP访问: $allow_ip_access"
-    log "实例目录: $INSTANCES_BASE/$instance_name"
+    # 创建Docker卷
+    create_docker_volumes
     
     # 生成配置文件
-    generate_docker_compose "$instance_name" "$deployment_type" "$domain" "$use_www" "$ODOO_IMAGE" "$POSTGRES_IMAGE" "$ODOO_VERSION" "$port" "$allow_ip_access"
-    
-    local instance_dir="$INSTANCES_BASE/$instance_name"
+    generate_docker_compose "$deployment_type" "$domain" "$use_www"
     
     # 如果是域名模式，获取SSL证书
     if [ "$deployment_type" = "domain" ]; then
         get_ssl_certificate "$domain" "$use_www"
     fi
     
-    # 预拉取Docker镜像
-    log "预拉取Docker镜像..."
-    get_docker_image "$POSTGRES_IMAGE" "postgres"
-    get_docker_image "$ODOO_IMAGE" "odoo"
-    
-    # 启动Docker容器
-    log "启动Docker容器..."
-    cd "$instance_dir"
-    docker-compose up -d
-    
-    # 等待服务启动
-    log "等待服务启动..."
-    sleep 30
-    
-    # 初始化数据库
-    log "初始化数据库..."
-    "$instance_dir/init-db.sh"
-    
-    # 重启Nginx以应用配置
-    log "重启Nginx..."
-    sudo nginx -t && sudo systemctl restart nginx
-    
-    # 设置cron作业
-    setup_cron_jobs "$instance_name"
-    
-    log "部署完成！"
-    log "========================================="
-    
-    if [ "$deployment_type" = "domain" ]; then
-        log "域名部署模式信息:"
-        if [ "$use_www" = "yes" ]; then
-            log "  访问地址1: https://$domain"
-            log "  访问地址2: https://www.$domain"
-        else
-            log "  访问地址: https://$domain"
-        fi
-        if [ "$allow_ip_access" = "yes" ]; then
-            log "  备用访问地址: http://$SERVER_IP:$port"
-        fi
-    else
-        log "本地部署模式信息:"
-        if [ "$allow_ip_access" = "yes" ]; then
-            log "  直接访问地址: http://$SERVER_IP:$port"
-        else
-            log "  通过Nginx访问地址: http://$SERVER_IP"
-        fi
-    fi
-    
-    log ""
-    log "管理员密码: 查看 $instance_dir/.env 文件"
-    log "实例目录: $instance_dir"
-    log "数据目录: $instance_dir/data"
-    log "备份目录: $instance_dir/backups"
-    log "日志目录: $instance_dir/logs"
-    log "========================================="
-    log ""
-    log "管理命令:"
-    log "  启动: cd $instance_dir && docker-compose start"
-    log "  停止: cd $instance_dir && docker-compose stop"
-    log "  重启: cd $instance_dir && docker-compose restart"
-    log "  查看日志: cd $instance_dir && docker-compose logs -f"
-    log "  备份数据库: $instance_dir/backup-db.sh"
-    log ""
-    log "重要: 首次登录后请立即修改管理员密码！"
-}
-
-# 设置cron作业
-setup_cron_jobs() {
-    local instance_name="$1"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    # 添加数据库备份任务（每天凌晨2点）
-    (crontab -l 2>/dev/null | grep -v "$instance_dir/backup-db.sh"; echo "0 2 * * * $instance_dir/backup-db.sh >> $instance_dir/logs/backup.log 2>&1") | crontab -
-    
-    # 添加日志清理任务（每周一凌晨3点）
-    (crontab -l 2>/dev/null | grep -v "$instance_dir/clean-logs.sh"; echo "0 3 * * 1 $instance_dir/clean-logs.sh >> $instance_dir/logs/cleanup.log 2>&1") | crontab -
-    
-    # 如果是域名模式，添加SSL证书续期检查
-    if [ -f "$instance_dir/.env" ] && grep -q "DEPLOYMENT_TYPE=domain" "$instance_dir/.env"; then
-        domain=$(grep "DOMAIN=" "$instance_dir/.env" 2>/dev/null | cut -d'=' -f2)
-        if [ -n "$domain" ]; then
-            (crontab -l 2>/dev/null | grep -v "certbot renew"; echo "0 12 * * * sudo certbot renew --quiet --post-hook \"sudo systemctl reload nginx\" >> $instance_dir/logs/certbot.log 2>&1") | crontab -
-        fi
-    fi
-    
-    log "Cron作业设置完成"
-}
-
-# 备份实例
-backup_instance() {
-    log "备份Odoo实例..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择要备份的实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    log "正在备份实例: $instance_name"
-    
-    # 创建备份目录
-    local backup_timestamp=$(date '+%Y%m%d_%H%M%S')
-    local backup_name="${instance_name}_${backup_timestamp}"
-    local backup_path="$BACKUP_DIR/$backup_name"
-    
-    sudo mkdir -p "$backup_path"
-    sudo chown $(whoami):$(whoami) "$backup_path"
-    
-    # 停止服务
-    log "停止服务..."
-    cd "$instance_dir"
-    docker-compose stop
-    
-    # 备份数据库
-    log "备份数据库..."
-    docker-compose exec -T db pg_dump -U odoo "odoo_${instance_name}" | gzip > "$backup_path/database.sql.gz"
-    
-    # 备份文件存储
-    log "备份文件存储..."
-    tar -czf "$backup_path/filestore.tar.gz" -C "$instance_dir/data" .
-    
-    # 备份插件
-    log "备份插件..."
-    tar -czf "$backup_path/addons.tar.gz" -C "$instance_dir/addons" .
-    
-    # 备份配置文件
-    log "备份配置文件..."
-    cp -r "$instance_dir/config" "$backup_path/"
-    cp "$instance_dir/docker-compose.yml" "$backup_path/"
-    cp "$instance_dir/.env" "$backup_path/"
-    
-    # 备份Nginx配置
-    if [ -f "/etc/nginx/sites-available/$instance_name" ]; then
-        sudo cp "/etc/nginx/sites-available/$instance_name" "$backup_path/nginx-site.conf"
-    fi
+    # 拉取Docker镜像
+    get_docker_image "$POSTGRES_IMAGE"
+    get_docker_image "$ODOO_IMAGE"
     
     # 启动服务
-    log "启动服务..."
-    docker-compose start
+    cd "$INSTANCE_DIR"
+    docker-compose up -d
     
-    # 创建恢复脚本
-    cat > "$backup_path/restore.sh" << EOF
-#!/bin/bash
-# Odoo实例恢复脚本
-# 实例: $instance_name
-# 备份时间: $backup_timestamp
-
-set -e
-
-echo "正在恢复Odoo实例: $instance_name"
-echo "备份时间: $backup_timestamp"
-
-# 检查是否具有sudo权限
-if ! sudo -n true 2>/dev/null; then
-    echo "此脚本需要sudo权限"
-    exit 1
-fi
-
-# 设置变量
-BACKUP_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-INSTANCE_NAME="$instance_name"
-INSTANCE_DIR="/opt/\$INSTANCE_NAME"
-
-echo "恢复目录: \$INSTANCE_DIR"
-
-# 停止现有实例（如果存在）
-if [ -d "\$INSTANCE_DIR" ]; then
-    echo "停止现有实例..."
-    cd "\$INSTANCE_DIR" && docker-compose down -v 2>/dev/null || true
-fi
-
-# 创建目录
-echo "创建目录..."
-mkdir -p "\$INSTANCE_DIR/addons"
-mkdir -p "\$INSTANCE_DIR/config"
-mkdir -p "\$INSTANCE_DIR/data"
-mkdir -p "\$INSTANCE_DIR/postgres_data"
-mkdir -p "\$INSTANCE_DIR/backups"
-mkdir -p "\$INSTANCE_DIR/logs"
-mkdir -p "\$INSTANCE_DIR/fonts"
-
-# 恢复文件
-echo "恢复文件..."
-tar -xzf "\$BACKUP_DIR/filestore.tar.gz" -C "\$INSTANCE_DIR/data"
-tar -xzf "\$BACKUP_DIR/addons.tar.gz" -C "\$INSTANCE_DIR/addons"
-cp -r "\$BACKUP_DIR/config" "\$INSTANCE_DIR/"
-cp "\$BACKUP_DIR/docker-compose.yml" "\$INSTANCE_DIR/"
-cp "\$BACKUP_DIR/.env" "\$INSTANCE_DIR/"
-
-# 恢复Nginx配置
-if [ -f "\$BACKUP_DIR/nginx-site.conf" ]; then
-    echo "恢复Nginx配置..."
-    sudo cp "\$BACKUP_DIR/nginx-site.conf" "/etc/nginx/sites-available/\$INSTANCE_NAME"
-    sudo ln -sf "/etc/nginx/sites-available/\$INSTANCE_NAME" "/etc/nginx/sites-enabled/"
-fi
-
-# 恢复数据库
-echo "恢复数据库..."
-cd "\$INSTANCE_DIR"
-docker-compose up -d db
-sleep 10
-gunzip -c "\$BACKUP_DIR/database.sql.gz" | docker-compose exec -T db psql -U odoo
-
-# 启动所有服务
-echo "启动所有服务..."
-docker-compose up -d
-
-# 重启Nginx
-sudo systemctl restart nginx
-
-# 设置权限
-CURRENT_USER=\$(whoami)
-sudo chown -R \$CURRENT_USER:\$CURRENT_USER "\$INSTANCE_DIR"
-sudo chown -R 999:999 "\$INSTANCE_DIR/postgres_data"
-
-echo ""
-echo "恢复完成！"
-echo "实例信息:"
-echo "  目录: \$INSTANCE_DIR"
-echo "  启动命令: cd \$INSTANCE_DIR && docker-compose up -d"
-echo "  查看日志: cd \$INSTANCE_DIR && docker-compose logs -f"
-echo ""
-echo "注意: 请检查 \$INSTANCE_DIR/.env 文件中的配置"
-EOF
+    # 等待数据库启动
+    sleep 10
     
-    chmod +x "$backup_path/restore.sh"
+    # 恢复数据库（如果有备份）
+    if [ -f "$backup_path/database.sql.gz" ]; then
+        log "恢复数据库..."
+        gunzip -c "$backup_path/database.sql.gz" | docker exec -i morhon-odoo-db psql -U odoo postgres 2>/dev/null || \
+        log_warn "数据库恢复失败，新实例将使用空数据库"
+    fi
     
-    # 创建压缩备份包
-    log "创建压缩备份包..."
-    cd "$BACKUP_DIR"
-    tar -czf "${backup_name}.tar.gz" "$backup_name"
-    sudo rm -rf "$backup_path"
+    # 重启Nginx
+    systemctl reload nginx
     
-    log "备份完成！"
-    log "备份文件: $BACKUP_DIR/${backup_name}.tar.gz"
-    log "大小: $(du -h "$BACKUP_DIR/${backup_name}.tar.gz" | cut -f1)"
+    log "迁移完成！"
+    log "实例目录: $INSTANCE_DIR"
+    log "备份文件: $backup_path"
+    
+    if [ "$deployment_type" = "domain" ]; then
+        log "访问地址: https://$domain"
+    else
+        local server_ip=$(get_server_ip)
+        log "访问地址: http://$server_ip"
+    fi
+    
+    return 0
 }
 
-# 恢复实例
-restore_instance() {
-    log "恢复Odoo实例..."
+# 从本地备份恢复
+restore_from_backup() {
+    log "从本地备份恢复..."
     
     # 列出备份文件
-    local backups=($(ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null))
+    local backup_files=($(find "$SCRIPT_DIR" -maxdepth 1 -name "*.tar.gz" -type f))
     
-    if [ ${#backups[@]} -eq 0 ]; then
+    if [ ${#backup_files[@]} -eq 0 ]; then
         log_error "未找到备份文件"
         return 1
     fi
     
-    echo "可用的备份:"
-    for i in "${!backups[@]}"; do
-        local backup_name=$(basename "${backups[$i]}" .tar.gz)
-        local backup_date=$(echo "$backup_name" | grep -o '[0-9]\{8\}_[0-9]\{6\}')
-        local readable_date=$(echo "$backup_date" | sed 's/\(....\)\(..\)\(..\)_\(..\)\(..\)\(..\)/\1年\2月\3日 \4时\5分\6秒/')
-        echo "$((i+1))) $backup_name ($readable_date)"
+    echo "发现备份文件:"
+    for i in "${!backup_files[@]}"; do
+        echo "$((i+1))) $(basename "${backup_files[$i]}")"
     done
     
-    read -p "选择要恢复的备份编号 [默认: 1]: " backup_choice
-    backup_choice=${backup_choice:-1}
-    local backup_index=$((backup_choice-1))
+    read -p "选择要恢复的备份文件 (1-${#backup_files[@]}) [默认: 1]: " choice
+    choice=${choice:-1}
     
-    if [ $backup_index -lt 0 ] || [ $backup_index -ge ${#backups[@]} ]; then
+    if [ $choice -lt 1 ] || [ $choice -gt ${#backup_files[@]} ]; then
         log_error "无效选择"
         return 1
     fi
     
-    local backup_file="${backups[$backup_index]}"
-    local backup_name=$(basename "$backup_file" .tar.gz)
-    local temp_dir="/tmp/odoo_restore_$(date '+%Y%m%d_%H%M%S')"
+    local backup_file="${backup_files[$((choice-1))]}"
+    log "正在恢复: $(basename "$backup_file")"
     
-    log "正在恢复备份: $backup_name"
+    # 询问域名
+    echo ""
+    echo "请输入域名（直接回车将使用本地模式）:"
+    read -p "域名: " domain
+    
+    local deployment_type="local"
+    local use_www="no"
+    
+    if [ -n "$domain" ]; then
+        deployment_type="domain"
+        read -p "是否同时支持www.$domain？(y/N): " use_www_choice
+        [[ "$use_www_choice" =~ ^[Yy]$ ]] && use_www="yes"
+    fi
     
     # 解压备份
+    local temp_dir="/tmp/restore_$(date '+%Y%m%d%H%M%S')"
     mkdir -p "$temp_dir"
     tar -xzf "$backup_file" -C "$temp_dir"
     
-    # 查找恢复脚本
-    local restore_script=$(find "$temp_dir" -name "restore.sh" -type f | head -1)
-    
-    if [ ! -f "$restore_script" ]; then
-        log_error "未找到恢复脚本"
+    # 查找备份数据
+    local backup_data=$(find "$temp_dir" -name "database.sql.gz" -type f | head -1)
+    if [ -z "$backup_data" ]; then
+        log_error "备份文件中未找到数据库文件"
         rm -rf "$temp_dir"
         return 1
     fi
     
-    # 运行恢复脚本
-    log "运行恢复脚本..."
-    chmod +x "$restore_script"
-    "$restore_script"
+    # 创建Docker卷
+    create_docker_volumes
+    
+    # 生成配置文件
+    generate_docker_compose "$deployment_type" "$domain" "$use_www"
+    
+    # 如果是域名模式，获取SSL证书
+    if [ "$deployment_type" = "domain" ]; then
+        get_ssl_certificate "$domain" "$use_www"
+    fi
+    
+    # 拉取Docker镜像
+    get_docker_image "$POSTGRES_IMAGE"
+    get_docker_image "$ODOO_IMAGE"
+    
+    # 启动数据库
+    cd "$INSTANCE_DIR"
+    docker-compose up -d db
+    
+    # 等待数据库启动
+    sleep 10
+    
+    # 恢复数据库
+    log "恢复数据库..."
+    gunzip -c "$backup_data" | docker exec -i morhon-odoo-db psql -U odoo postgres 2>/dev/null || \
+    log_warn "数据库恢复失败，将使用空数据库"
+    
+    # 启动所有服务
+    docker-compose up -d
+    
+    # 重启Nginx
+    systemctl reload nginx
     
     # 清理临时文件
     rm -rf "$temp_dir"
     
     log "恢复完成！"
-    log "请检查实例配置并启动服务"
-}
-
-# 查看日志
-view_logs() {
-    log "查看Odoo日志..."
     
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    echo "选择日志类型:"
-    echo "1) Odoo应用日志"
-    echo "2) PostgreSQL数据库日志"
-    echo "3) Nginx访问日志"
-    echo "4) Nginx错误日志"
-    echo "5) 所有日志（实时跟踪）"
-    read -p "选择 (1-5) [默认: 1]: " log_choice
-    log_choice=${log_choice:-1}
-    
-    cd "$instance_dir"
-    
-    case $log_choice in
-        1)
-            docker-compose logs -f odoo
-            ;;
-        2)
-            docker-compose logs -f db
-            ;;
-        3)
-            if [ -f "/var/log/nginx/${instance_name}-ssl-access.log" ]; then
-                sudo tail -f "/var/log/nginx/${instance_name}-ssl-access.log"
-            elif [ -f "/var/log/nginx/${instance_name}-access.log" ]; then
-                sudo tail -f "/var/log/nginx/${instance_name}-access.log"
-            else
-                sudo tail -f "/var/log/nginx/access.log"
-            fi
-            ;;
-        4)
-            if [ -f "/var/log/nginx/${instance_name}-ssl-error.log" ]; then
-                sudo tail -f "/var/log/nginx/${instance_name}-ssl-error.log"
-            elif [ -f "/var/log/nginx/${instance_name}-error.log" ]; then
-                sudo tail -f "/var/log/nginx/${instance_name}-error.log"
-            else
-                sudo tail -f "/var/log/nginx/error.log"
-            fi
-            ;;
-        5)
-            docker-compose logs -f
-            ;;
-        *)
-            log_error "无效选择"
-            return 1
-            ;;
-    esac
-}
-
-# 分析日志
-analyze_logs() {
-    log "分析Odoo日志..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    echo "选择分析类型:"
-    echo "1) 错误和警告统计"
-    echo "2) 慢请求分析"
-    echo "3) 数据库查询分析"
-    echo "4) 内存使用分析"
-    echo "5) 访问量统计"
-    read -p "选择 (1-5) [默认: 1]: " analysis_choice
-    analysis_choice=${analysis_choice:-1}
-    
-    case $analysis_choice in
-        1)
-            echo "=== 错误和警告统计 ==="
-            echo ""
-            echo "最近24小时的错误:"
-            docker-compose logs --since 24h odoo 2>/dev/null | grep -i "error\|exception\|traceback" | tail -20
-            
-            echo ""
-            echo "最近24小时的警告:"
-            docker-compose logs --since 24h odoo 2>/dev/null | grep -i "warning" | tail -20
-            ;;
-        2)
-            echo "=== 慢请求分析 ==="
-            echo ""
-            echo "处理时间超过2秒的请求:"
-            docker-compose logs --since 24h odoo 2>/dev/null | grep "INFO.*req.*RUN.*time=" | awk -F'time=' '{print $2}' | awk '{if($1>2000) print $1 "ms"}' | sort -n | tail -20
-            ;;
-        3)
-            echo "=== 数据库查询分析 ==="
-            echo ""
-            echo "最耗时的SQL查询:"
-            docker-compose exec db psql -U odoo -d "odoo_${instance_name}" -c "
-                SELECT query, calls, total_time, mean_time,
-                       rows, 100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0) AS hit_percent
-                FROM pg_stat_statements 
-                ORDER BY total_time DESC 
-                LIMIT 10;
-            " 2>/dev/null || echo "需要启用pg_stat_statements扩展"
-            ;;
-        4)
-            echo "=== 内存使用分析 ==="
-            echo ""
-            echo "容器内存使用:"
-            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" $(docker-compose ps -q)
-            
-            echo ""
-            echo "系统内存使用:"
-            free -h
-            ;;
-        5)
-            echo "=== 访问量统计 ==="
-            echo ""
-            echo "最近1小时的访问统计:"
-            if [ -f "/var/log/nginx/${instance_name}-ssl-access.log" ]; then
-                sudo awk -vDate="$(date -d'1 hour ago' '+[%d/%b/%Y:%H:%M:%S')" '$4 > Date {print $1}' "/var/log/nginx/${instance_name}-ssl-access.log" | sort | uniq -c | sort -rn | head -10 | awk '{print $2 " - " $1 " 次访问"}'
-            elif [ -f "/var/log/nginx/${instance_name}-access.log" ]; then
-                sudo awk -vDate="$(date -d'1 hour ago' '+[%d/%b/%Y:%H:%M:%S')" '$4 > Date {print $1}' "/var/log/nginx/${instance_name}-access.log" | sort | uniq -c | sort -rn | head -10 | awk '{print $2 " - " $1 " 次访问"}'
-            else
-                echo "访问日志文件不存在"
-            fi
-            ;;
-        *)
-            log_error "无效选择"
-            return 1
-            ;;
-    esac
-}
-
-# 启动实例
-start_instance() {
-    log "启动Odoo实例..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    log "启动实例: $instance_name"
-    cd "$instance_dir"
-    docker-compose start
-    
-    log "实例 $instance_name 已启动"
-}
-
-# 停止实例
-stop_instance() {
-    log "停止Odoo实例..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    log "停止实例: $instance_name"
-    cd "$instance_dir"
-    docker-compose stop
-    
-    log "实例 $instance_name 已停止"
-}
-
-# 重启实例
-restart_instance() {
-    log "重启Odoo实例..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号 [默认: 1]: " instance_choice
-    instance_choice=${instance_choice:-1}
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    log "重启实例: $instance_name"
-    cd "$instance_dir"
-    docker-compose restart
-    
-    log "实例 $instance_name 已重启"
-}
-
-# 删除实例
-delete_instance() {
-    log "删除Odoo实例..."
-    
-    # 查找所有实例
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    
-    if [ ${#instances[@]} -eq 0 ]; then
-        log_error "未找到任何Odoo实例"
-        return 1
-    fi
-    
-    echo "可用的实例:"
-    for i in "${!instances[@]}"; do
-        echo "$((i+1))) ${instances[$i]}"
-    done
-    
-    read -p "选择实例编号: " instance_choice
-    local instance_index=$((instance_choice-1))
-    
-    if [ $instance_index -lt 0 ] || [ $instance_index -ge ${#instances[@]} ]; then
-        log_error "无效选择"
-        return 1
-    fi
-    
-    local instance_name="${instances[$instance_index]}"
-    local instance_dir="$INSTANCES_BASE/$instance_name"
-    
-    read -p "确定要删除实例 '$instance_name' 吗？这将删除所有数据！(输入 'yes' 确认): " confirm
-    
-    if [ "$confirm" != "yes" ]; then
-        log "取消删除"
-        return
-    fi
-    
-    log "删除实例: $instance_name"
-    
-    # 停止并删除容器
-    cd "$instance_dir"
-    docker-compose down -v 2>/dev/null || true
-    
-    # 删除目录
-    sudo rm -rf "$instance_dir"
-    
-    # 删除Nginx配置
-    sudo rm -f "/etc/nginx/sites-available/$instance_name"
-    sudo rm -f "/etc/nginx/sites-enabled/$instance_name"
-    
-    # 删除cron作业
-    crontab -l 2>/dev/null | grep -v "$instance_dir" | crontab -
-    
-    # 重启Nginx
-    sudo systemctl reload nginx
-    
-    log "实例 $instance_name 已删除"
-}
-
-# 系统监控
-system_monitor() {
-    log "系统监控信息:"
-    echo ""
-    echo "========================================="
-    echo "1. 系统资源使用:"
-    echo "-----------------------------------------"
-    echo "CPU使用率:"
-    top -bn1 | grep "Cpu(s)" | awk '{print "  用户: " $2 "%", "系统: " $4 "%", "空闲: " $8 "%"}'
-    
-    echo ""
-    echo "内存使用:"
-    free -h | awk 'NR==1{print "         总量     已用     空闲     共享  缓冲/缓存  可用"}
-                   NR==2{printf "内存: %6s %6s %6s %6s %6s %6s\n", $2, $3, $4, $5, $6, $7}'
-    
-    echo ""
-    echo "磁盘使用:"
-    df -h / | awk 'NR==1{print "文件系统   容量  已用  可用 使用% 挂载点"}
-                   NR==2{print $1, $2, $3, $4, $5, $6}'
-    
-    echo ""
-    echo "2. Docker容器状态:"
-    echo "-----------------------------------------"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -20
-    
-    echo ""
-    echo "3. Odoo实例状态:"
-    echo "-----------------------------------------"
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    if [ ${#instances[@]} -gt 0 ]; then
-        for instance in "${instances[@]}"; do
-            local instance_dir="$INSTANCES_BASE/$instance"
-            if [ -f "$instance_dir/docker-compose.yml" ]; then
-                cd "$instance_dir"
-                echo "实例: $instance"
-                docker-compose ps --services | while read service; do
-                    status=$(docker-compose ps $service | tail -1)
-                    echo "  $service: $status"
-                done
-                echo ""
-            fi
-        done
+    if [ "$deployment_type" = "domain" ]; then
+        log "访问地址: https://$domain"
     else
-        echo "未找到Odoo实例"
+        local server_ip=$(get_server_ip)
+        log "访问地址: http://$server_ip"
     fi
     
-    echo "4. 网络连接:"
-    echo "-----------------------------------------"
-    echo "监听端口:"
-    sudo ss -tuln | grep LISTEN | awk '{print "  " $5 " -> " $1}' | head -10
-    
-    echo ""
-    echo "5. 防火墙状态:"
-    echo "-----------------------------------------"
-    sudo ufw status | head -10
-    
-    echo ""
-    echo "6. 最近错误日志:"
-    echo "-----------------------------------------"
-    tail -5 "$LOG_DIR/odoo-manager.log" | grep -i "error\|warning" || echo "  无错误或警告"
-    
-    echo "========================================="
+    return 0
 }
 
-# 优化检查
-optimization_check() {
-    log "系统优化检查..."
-    echo ""
+# 全新部署
+deploy_new_instance() {
+    log "全新部署茂亨Odoo..."
     
-    echo "1. 系统参数检查:"
-    echo "-----------------------------------------"
-    local sysctl_params=("vm.swappiness" "vm.vfs_cache_pressure" "net.core.somaxconn")
-    for param in "${sysctl_params[@]}"; do
-        value=$(sudo sysctl -n $param 2>/dev/null || echo "未设置")
-        echo "  $param = $value"
-    done
-    
+    # 询问域名
     echo ""
-    echo "2. Docker配置检查:"
-    echo "-----------------------------------------"
-    if [ -f "/etc/docker/daemon.json" ]; then
-        echo "  Docker配置文件存在"
-        docker info 2>/dev/null | grep -i "storage\|log" | head -5
-    else
-        echo "  Docker配置文件不存在"
+    echo "请输入域名（直接回车将使用本地模式）:"
+    read -p "域名: " domain
+    
+    local deployment_type="local"
+    local use_www="no"
+    
+    if [ -n "$domain" ]; then
+        deployment_type="domain"
+        read -p "是否同时支持www.$domain？(y/N): " use_www_choice
+        [[ "$use_www_choice" =~ ^[Yy]$ ]] && use_www="yes"
     fi
     
-    echo ""
-    echo "3. 网络连通性检查:"
-    echo "-----------------------------------------"
-    check_network_connectivity
-    echo "  Docker官方源: $(if [ "$USE_DOCKER_HUB" = true ]; then echo "可用"; else echo "不可用"; fi)"
-    echo "  阿里云源: $(if [ "$ALIYUN_AVAILABLE" = true ]; then echo "可用"; else echo "不可用"; fi)"
-    
-    echo ""
-    echo "4. 服务状态检查:"
-    echo "-----------------------------------------"
-    local services=("docker" "nginx")
-    for service in "${services[@]}"; do
-        if systemctl is-active --quiet "$service"; then
-            echo "  $service: 运行中"
-        else
-            echo "  $service: 未运行"
+    # 初始化环境（如果需要）
+    if ! command -v docker &> /dev/null || ! command -v nginx &> /dev/null; then
+        read -p "检测到缺少依赖，是否初始化环境？(Y/n): " init_env
+        if [[ ! "$init_env" =~ ^[Nn]$ ]]; then
+            init_environment
         fi
-    done
-    
-    echo ""
-    echo "5. 安全配置检查:"
-    echo "-----------------------------------------"
-    echo "  防火墙状态:"
-    sudo ufw status | head -10
-    
-    echo ""
-    echo "  证书状态检查:"
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    for instance in "${instances[@]}"; do
-        if [ -f "$INSTANCES_BASE/$instance/.env" ]; then
-            domain=$(grep "DOMAIN=" "$INSTANCES_BASE/$instance/.env" 2>/dev/null | cut -d'=' -f2)
-            if [ -n "$domain" ] && [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
-                expiry=$(sudo openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$domain/fullchain.pem" | cut -d'=' -f2)
-                echo "  $instance ($domain): 证书有效至 $expiry"
-            fi
-        fi
-    done
-}
-
-# 显示菜单
-show_menu() {
-    clear
-    echo -e "${BLUE}=========================================${NC}"
-    echo -e "${BLUE}      Odoo VPS 管理脚本 v6.0${NC}"
-    echo -e "${BLUE}=========================================${NC}"
-    echo -e "${GREEN}1) 初始化环境${NC}"
-    echo -e "${GREEN}2) 部署Odoo实例${NC}"
-    echo -e "${YELLOW}3) 备份实例${NC}"
-    echo -e "${YELLOW}4) 恢复实例${NC}"
-    echo -e "${CYAN}5) 查看日志${NC}"
-    echo -e "${CYAN}6) 分析日志${NC}"
-    echo -e "${PURPLE}7) 启动实例${NC}"
-    echo -e "${PURPLE}8) 停止实例${NC}"
-    echo -e "${PURPLE}9) 重启实例${NC}"
-    echo -e "${RED}10) 删除实例${NC}"
-    echo -e "${BLUE}11) 系统监控${NC}"
-    echo -e "${BLUE}12) 优化检查${NC}"
-    echo -e "${RED}13) 退出${NC}"
-    echo -e "${BLUE}=========================================${NC}"
-    
-    local instances=($(ls -d $INSTANCES_BASE/*/ 2>/dev/null | xargs -n1 basename))
-    if [ ${#instances[@]} -gt 0 ]; then
-        echo -e "${GREEN}当前实例:${NC}"
-        for instance in "${instances[@]}"; do
-            echo "  - $instance"
-        done
-    else
-        echo -e "${YELLOW}暂无Odoo实例${NC}"
-    fi
-    echo -e "${BLUE}=========================================${NC}"
-}
-
-# 快速部署函数（只需要实例名称）
-quick_deploy() {
-    local instance_name="$1"
-    
-    if [[ -z "$instance_name" ]]; then
-        log_error "实例名称不能为空"
-        return 1
     fi
     
-    log "快速本地部署 Odoo 实例: $instance_name"
-    
-    # 检查是否已初始化
-    if [ ! -f "$CONFIG_DIR/initialized" ]; then
-        log "系统未初始化，正在初始化..."
-        init_environment
-        sudo touch "$CONFIG_DIR/initialized"
-    fi
-    
-    # 获取系统信息
-    get_system_info
-    
-    # 检查实例是否已存在
-    if [ -d "$INSTANCES_BASE/$instance_name" ]; then
-        log_error "实例 '$instance_name' 已存在"
-        return 1
-    fi
-    
-    # 本地部署模式
-    deployment_type="local"
-    domain=""
-    use_www="no"
-    allow_ip_access="yes"  # 快速部署默认允许IP访问
-    
-    # 使用默认Trade Odoo 17镜像
-    ODOO_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest"
-    POSTGRES_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/postgres:latest"
-    ODOO_VERSION="17.0-Trade"
-    
-    # 自动分配端口
-    for port in {8069..8100}; do
-        if check_port "$port"; then
-            break
-        fi
-    done
-    
-    # 开放防火墙端口
-    sudo ufw allow "$port/tcp"
-    
-    log "使用配置:"
-    log "  实例名称: $instance_name"
-    log "  部署模式: 本地部署"
-    log "  允许IP访问: 是"
-    log "  Odoo镜像: $ODOO_IMAGE"
-    log "  PostgreSQL镜像: $POSTGRES_IMAGE"
-    log "  端口: $port"
+    # 创建Docker卷
+    create_docker_volumes
     
     # 生成配置文件
-    generate_docker_compose "$instance_name" "$deployment_type" "$domain" "$use_www" "$ODOO_IMAGE" "$POSTGRES_IMAGE" "$ODOO_VERSION" "$port" "$allow_ip_access"
+    generate_docker_compose "$deployment_type" "$domain" "$use_www"
     
-    local instance_dir="$INSTANCES_BASE/$instance_name"
+    # 如果是域名模式，获取SSL证书
+    if [ "$deployment_type" = "domain" ]; then
+        get_ssl_certificate "$domain" "$use_www"
+    fi
     
-    # 预拉取Docker镜像
-    log "预拉取Docker镜像..."
-    get_docker_image "$POSTGRES_IMAGE" "postgres"
-    get_docker_image "$ODOO_IMAGE" "odoo"
+    # 拉取Docker镜像
+    get_docker_image "$POSTGRES_IMAGE"
+    get_docker_image "$ODOO_IMAGE"
     
-    # 启动Docker容器
-    cd "$instance_dir"
+    # 启动服务
+    cd "$INSTANCE_DIR"
     docker-compose up -d
     
-    # 等待服务启动
-    sleep 30
+    # 重启Nginx
+    systemctl reload nginx
     
-    # 初始化数据库
-    "$instance_dir/init-db.sh"
+    log "部署完成！"
     
-    # 设置cron作业
-    setup_cron_jobs "$instance_name"
+    if [ "$deployment_type" = "domain" ]; then
+        log "访问地址: https://$domain"
+    else
+        local server_ip=$(get_server_ip)
+        log "访问地址: http://$server_ip"
+    fi
     
-    log "快速本地部署完成！"
-    log "访问地址: http://$SERVER_IP:$port"
-    log "管理员密码: 查看 $instance_dir/.env 文件"
+    log "管理员密码: 查看 $INSTANCE_DIR/.env 文件"
+    return 0
+}
+
+# 管理脚本部署的实例
+manage_script_instance() {
+    echo ""
+    echo -e "${GREEN}脚本管理实例菜单${NC}"
+    echo "实例目录: $INSTANCE_DIR"
+    echo ""
+    echo "1) 查看实例状态"
+    echo "2) 重启实例"
+    echo "3) 查看日志"
+    echo "4) 备份实例"
+    echo "5) 修改配置"
+    echo "6) 返回主菜单"
+    echo ""
+    read -p "请选择操作 (1-6): " choice
+    
+    case $choice in
+        1)
+            echo ""
+            echo -e "${CYAN}实例状态:${NC}"
+            cd "$INSTANCE_DIR"
+            docker-compose ps
+            echo ""
+            echo -e "${CYAN}卷状态:${NC}"
+            docker volume ls | grep -E "($DB_VOLUME_NAME|$ODOO_VOLUME_NAME)"
+            ;;
+        2)
+            echo ""
+            cd "$INSTANCE_DIR"
+            docker-compose restart
+            systemctl reload nginx
+            log "实例已重启"
+            ;;
+        3)
+            echo ""
+            echo "1) Odoo日志"
+            echo "2) 数据库日志"
+            echo "3) Nginx日志"
+            read -p "选择日志类型 (1-3): " log_type
+            case $log_type in
+                1) cd "$INSTANCE_DIR" && docker-compose logs -f odoo ;;
+                2) cd "$INSTANCE_DIR" && docker-compose logs -f db ;;
+                3) tail -f /var/log/nginx/error.log ;;
+                *) log_error "无效选择" ;;
+            esac
+            ;;
+        4)
+            echo ""
+            backup_name="backup_$(date '+%Y%m%d_%H%M%S')"
+            backup_path="$BACKUP_DIR/$backup_name"
+            mkdir -p "$backup_path"
+            
+            cd "$INSTANCE_DIR"
+            docker-compose exec -T db pg_dump -U odoo postgres | gzip > "$backup_path/database.sql.gz"
+            
+            cp -r "$INSTANCE_DIR/config" "$backup_path/"
+            cp "$INSTANCE_DIR/docker-compose.yml" "$backup_path/"
+            cp "$INSTANCE_DIR/.env" "$backup_path/"
+            
+            cd "$BACKUP_DIR"
+            tar -czf "${backup_name}.tar.gz" "$backup_name"
+            rm -rf "$backup_path"
+            
+            log "备份完成: $BACKUP_DIR/${backup_name}.tar.gz"
+            ;;
+        5)
+            echo ""
+            echo "1) 修改管理员密码"
+            echo "2) 修改数据库密码"
+            echo "3) 修改Nginx配置"
+            read -p "选择操作 (1-3): " config_choice
+            case $config_choice in
+                1)
+                    read -p "输入新管理员密码: " new_pass
+                    sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
+                    cd "$INSTANCE_DIR" && docker-compose restart odoo
+                    log "管理员密码已更新"
+                    ;;
+                2)
+                    read -p "输入新数据库密码: " new_pass
+                    sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
+                    cd "$INSTANCE_DIR" && docker-compose restart
+                    log "数据库密码已更新"
+                    ;;
+                3)
+                    nano /etc/nginx/sites-available/morhon-odoo
+                    nginx -t && systemctl reload nginx
+                    log "Nginx配置已更新"
+                    ;;
+                *) log_error "无效选择" ;;
+            esac
+            ;;
+        6)
+            return 1  # 返回主菜单
+            ;;
+        *)
+            log_error "无效选择"
+            ;;
+    esac
+    
+    return 0  # 继续显示管理菜单
+}
+
+# 显示主菜单
+show_main_menu() {
+    clear
+    echo -e "${PURPLE}================================${NC}"
+    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.0${NC}"
+    echo -e "${PURPLE}================================${NC}"
+    echo ""
+    
+    # 根据检测结果显示不同菜单
+    case "$DETECTED_INSTANCE_TYPE" in
+        "script")
+            echo -e "${GREEN}✓ 检测到脚本管理的实例${NC}"
+            echo "实例目录: $INSTANCE_DIR"
+            echo ""
+            echo "1) 管理实例"
+            echo "2) 退出"
+            echo ""
+            read -p "请选择 (1-2): " choice
+            
+            case $choice in
+                1)
+                    while manage_script_instance; do
+                        echo ""
+                        read -p "按回车键继续..."
+                    done
+                    ;;
+                2) exit 0 ;;
+                *) log_error "无效选择" ;;
+            esac
+            ;;
+            
+        "manual")
+            echo -e "${YELLOW}⚠ 检测到手动部署的实例${NC}"
+            echo "Odoo容器: $DETECTED_ODOO_CONTAINER"
+            [ -n "$DETECTED_DB_CONTAINER" ] && echo "数据库容器: $DETECTED_DB_CONTAINER"
+            [ -n "$DETECTED_DOMAIN" ] && echo "域名: $DETECTED_DOMAIN"
+            echo ""
+            echo "1) 迁移到脚本管理"
+            echo "2) 查看容器信息"
+            echo "3) 退出"
+            echo ""
+            read -p "请选择 (1-3): " choice
+            
+            case $choice in
+                1) migrate_manual_instance ;;
+                2)
+                    echo ""
+                    docker ps -a | grep -E "($DETECTED_ODOO_CONTAINER|$DETECTED_DB_CONTAINER)"
+                    echo ""
+                    echo "Odoo配置:"
+                    docker exec "$DETECTED_ODOO_CONTAINER" cat /etc/odoo/odoo.conf 2>/dev/null || echo "无法读取配置"
+                    ;;
+                3) exit 0 ;;
+                *) log_error "无效选择" ;;
+            esac
+            ;;
+            
+        "none")
+            echo -e "${BLUE}○ 未检测到现有实例${NC}"
+            echo ""
+            
+            if [ "$HAS_LOCAL_BACKUP" = true ]; then
+                echo "检测到本地备份文件"
+                echo "1) 从备份恢复"
+                echo "2) 全新部署"
+                echo "3) 退出"
+                echo ""
+                read -p "请选择 (1-3): " choice
+                
+                case $choice in
+                    1) restore_from_backup ;;
+                    2) deploy_new_instance ;;
+                    3) exit 0 ;;
+                    *) log_error "无效选择" ;;
+                esac
+            else
+                echo "1) 全新部署"
+                echo "2) 退出"
+                echo ""
+                read -p "请选择 (1-2): " choice
+                
+                case $choice in
+                    1) deploy_new_instance ;;
+                    2) exit 0 ;;
+                    *) log_error "无效选择" ;;
+                esac
+            fi
+            ;;
+    esac
 }
 
 # 主函数
 main() {
-    # 检查sudo权限
     check_sudo
     
-    # 确保日志目录存在
-    sudo mkdir -p "$LOG_DIR"
-    sudo chown $(whoami):$(whoami) "$LOG_DIR" 2>/dev/null || true
+    # 一次性检测所有环境信息
+    detect_environment
     
-    # 处理命令行参数
-    if [ $# -ge 1 ]; then
-        case "$1" in
-            "init")
-                init_environment
-                sudo touch "$CONFIG_DIR/initialized"
-                exit 0
-                ;;
-            "deploy")
-                if [ $# -ge 2 ]; then
-                    quick_deploy "$2"
-                else
-                    deploy_odoo
-                fi
-                exit 0
-                ;;
-            "backup")
-                backup_instance
-                exit 0
-                ;;
-            "restore")
-                restore_instance
-                exit 0
-                ;;
-            "logs")
-                view_logs
-                exit 0
-                ;;
-            "analyze")
-                analyze_logs
-                exit 0
-                ;;
-            "start")
-                start_instance
-                exit 0
-                ;;
-            "stop")
-                stop_instance
-                exit 0
-                ;;
-            "restart")
-                restart_instance
-                exit 0
-                ;;
-            "delete")
-                delete_instance
-                exit 0
-                ;;
-            "monitor")
-                system_monitor
-                exit 0
-                ;;
-            "optimize")
-                optimization_check
-                exit 0
-                ;;
-            "help"|"--help"|"-h")
-                echo "用法: $0 [命令] [参数]"
-                echo ""
-                echo "命令:"
-                echo "  init                  初始化环境"
-                echo "  deploy [实例名]       快速本地部署Odoo实例"
-                echo "  backup                备份实例"
-                echo "  restore               恢复实例"
-                echo "  logs                  查看日志"
-                echo "  analyze               分析日志"
-                echo "  start                 启动实例"
-                echo "  stop                  停止实例"
-                echo "  restart               重启实例"
-                echo "  delete                删除实例"
-                echo "  monitor               系统监控"
-                echo "  optimize              优化检查"
-                echo "  help                  显示帮助"
-                echo ""
-                echo "示例:"
-                echo "  $0 init               初始化环境"
-                echo "  $0 deploy my-odoo     快速本地部署my-odoo实例"
-                echo "  $0 deploy             交互式部署（支持域名和本地模式）"
-                echo ""
-                echo "智能镜像源策略:"
-                echo "  ✓ 自动检测网络连通性"
-                echo "  ✓ 优先使用Docker官方源"
-                echo "  ✓ 官方源不可用时自动切换国内源"
-                echo ""
-                echo "部署模式:"
-                echo "  1. 域名模式: 需要域名，配置HTTPS，支持安全策略"
-                echo "  2. 本地模式: 无需域名，通过IP访问，适合内网环境"
-                exit 0
-                ;;
-        esac
-    fi
-    
-    # 主循环（交互式菜单）
-    while true; do
-        show_menu
-        echo ""
-        read -p "请选择操作 (1-13): " choice
-        
-        case $choice in
-            1)
-                init_environment
-                sudo touch "$CONFIG_DIR/initialized"
-                ;;
-            2)
-                deploy_odoo
-                ;;
-            3)
-                backup_instance
-                ;;
-            4)
-                restore_instance
-                ;;
-            5)
-                view_logs
-                ;;
-            6)
-                analyze_logs
-                ;;
-            7)
-                start_instance
-                ;;
-            8)
-                stop_instance
-                ;;
-            9)
-                restart_instance
-                ;;
-            10)
-                delete_instance
-                ;;
-            11)
-                system_monitor
-                ;;
-            12)
-                optimization_check
-                ;;
-            13)
-                log "退出脚本"
-                exit 0
-                ;;
-            *)
-                log_error "无效选择，请重新输入"
-                ;;
-        esac
-        
-        echo ""
-        read -p "按回车键继续..."
-    done
+    # 显示主菜单
+    show_main_menu
 }
 
-# 运行主函数
+# 处理命令行参数
+if [ $# -ge 1 ]; then
+    case "$1" in
+        "init")
+            check_sudo
+            init_environment
+            exit 0
+            ;;
+        "backup")
+            check_sudo
+            detect_environment
+            if [ "$DETECTED_INSTANCE_TYPE" = "script" ]; then
+                backup_name="backup_$(date '+%Y%m%d_%H%M%S')"
+                backup_path="$BACKUP_DIR/$backup_name"
+                mkdir -p "$backup_path"
+                
+                cd "$INSTANCE_DIR"
+                docker-compose exec -T db pg_dump -U odoo postgres | gzip > "$backup_path/database.sql.gz"
+                
+                cp -r "$INSTANCE_DIR/config" "$backup_path/"
+                cp "$INSTANCE_DIR/docker-compose.yml" "$backup_path/"
+                cp "$INSTANCE_DIR/.env" "$backup_path/"
+                
+                cd "$BACKUP_DIR"
+                tar -czf "${backup_name}.tar.gz" "$backup_name"
+                rm -rf "$backup_path"
+                
+                log "备份完成: $BACKUP_DIR/${backup_name}.tar.gz"
+            else
+                log_error "仅支持脚本管理的实例备份"
+            fi
+            exit 0
+            ;;
+        "help"|"--help"|"-h")
+            echo "茂亨Odoo管理脚本 v6.0"
+            echo "用法: $0 [命令]"
+            echo ""
+            echo "命令:"
+            echo "  (无参数)   启动交互式菜单"
+            echo "  init       初始化环境（安装依赖）"
+            echo "  backup     备份脚本管理的实例"
+            echo "  help       显示帮助"
+            echo ""
+            echo "运行逻辑:"
+            echo "  1. 检测是否已有实例"
+            echo "  2. 脚本实例 → 管理菜单"
+            echo "  3. 手动实例 → 迁移菜单"
+            echo "  4. 无实例 → 检查备份 → 恢复/全新部署"
+            echo ""
+            echo "部署模式:"
+            echo "  • 本地模式: 通过IP地址访问，无需端口"
+            echo "  • 域名模式: 通过域名访问，强制HTTPS"
+            exit 0
+            ;;
+    esac
+fi
+
+# 执行主函数
 main "$@"
