@@ -1215,7 +1215,12 @@ create_docker_compose_config() {
     local total_mem=$(free -g | awk '/^Mem:/{print $2}')
     
     # 外贸管理系统资源分配策略
-    local redis_memory=$((total_mem * 1024))  # Redis使用1GB内存（外贸管理系统缓存需求大）
+    local redis_memory=1024  # Redis使用1GB内存（外贸管理系统缓存需求大）
+    # 如果内存大于8GB，Redis可以使用更多内存
+    if [ "$total_mem" -gt 8 ]; then
+        redis_memory=$((total_mem * 128))  # 大内存服务器Redis使用12.5%内存
+        [ "$redis_memory" -gt 4096 ] && redis_memory=4096  # 最大4GB
+    fi
     local db_memory="${total_mem}g"
     local db_shared_buffers=$((total_mem * 256))  # 25% 内存作为shared_buffers
     local db_effective_cache_size=$((total_mem * 768))  # 75% 内存作为effective_cache_size
