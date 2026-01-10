@@ -205,9 +205,9 @@ get_server_ip() {
     echo "$ip"
 }
 
-# 初始化环境
+# 初始化环境 - 专用服务器优化
 init_environment() {
-    log "初始化环境..."
+    log "初始化专用服务器环境..."
     
     # 更新系统
     log "更新系统包..."
@@ -232,6 +232,10 @@ init_environment() {
         nginx \
         ufw \
         net-tools \
+        htop \
+        iotop \
+        sysstat \
+        bc \
         software-properties-common \
         apt-transport-https \
         ca-certificates \
@@ -248,14 +252,260 @@ init_environment() {
         install_docker_compose
     fi
     
+    # 专用服务器系统优化
+    optimize_system_for_odoo
+    
     # 配置防火墙
     configure_firewall
     
     # 配置Nginx
     configure_nginx
     
-    log "环境初始化完成"
+    log "专用服务器环境初始化完成"
     return 0
+}
+
+# 专用服务器系统优化
+optimize_system_for_odoo() {
+    log "执行专用服务器系统优化..."
+    
+    # 获取系统资源信息
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    
+    # 内核参数优化 - 外贸管理系统专用
+    log "优化内核参数（外贸管理系统专用）..."
+    cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
+# 茂亨Odoo外贸管理系统内核优化
+
+# 网络优化（外贸管理系统需要处理大量并发连接）
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 10000
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_recycle = 0
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_rmem = 4096 65536 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+
+# 内存管理优化（外贸管理系统大数据处理）
+vm.swappiness = 1
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 3
+vm.overcommit_memory = 1
+vm.overcommit_ratio = 80
+vm.vfs_cache_pressure = 50
+
+# 文件系统优化（外贸管理系统文档处理）
+fs.file-max = 2097152
+fs.nr_open = 2097152
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 512
+
+# 进程优化
+kernel.pid_max = 4194304
+kernel.threads-max = 4194304
+
+# 安全优化
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.tcp_syncookies = 1
+EOF
+    
+    # 应用内核参数
+    sysctl -p /etc/sysctl.d/99-morhon-odoo.conf
+    
+    # 系统限制优化
+    log "优化系统限制..."
+    cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
+# 茂亨Odoo专用服务器限制优化
+* soft nofile 65536
+* hard nofile 65536
+* soft nproc 32768
+* hard nproc 32768
+root soft nofile 65536
+root hard nofile 65536
+www-data soft nofile 65536
+www-data hard nofile 65536
+EOF
+    
+    # Docker优化
+    log "优化Docker配置..."
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << EOF
+{
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "100m",
+        "max-file": "3"
+    },
+    "storage-driver": "overlay2",
+    "default-ulimits": {
+        "nofile": {
+            "Name": "nofile",
+            "Hard": 65536,
+            "Soft": 65536
+        },
+        "nproc": {
+            "Name": "nproc",
+            "Hard": 32768,
+            "Soft": 32768
+        }
+    }
+}
+EOF
+    
+    # 重启Docker服务
+    systemctl restart docker
+    
+    # 磁盘I/O优化
+    log "优化磁盘I/O..."
+    # 检测磁盘类型并优化
+    for disk in $(lsblk -d -o name | grep -E '^[sv]d[a-z]$|^nvme'); do
+        if [ -b "/dev/$disk" ]; then
+            # SSD优化
+            echo noop > /sys/block/$disk/queue/scheduler 2>/dev/null || \
+            echo none > /sys/block/$disk/queue/scheduler 2>/dev/null || true
+            echo 0 > /sys/block/$disk/queue/rotational 2>/dev/null || true
+            echo 1 > /sys/block/$disk/queue/iosched/fifo_batch 2>/dev/null || true
+        fi
+    done
+    
+    # 日志轮转优化
+    log "配置日志轮转..."
+    cat > /etc/logrotate.d/morhon-odoo << EOF
+/var/log/morhon-odoo/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    create 644 root root
+}
+
+/var/log/nginx/morhon-odoo-*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 644 www-data www-data
+    postrotate
+        systemctl reload nginx > /dev/null 2>&1 || true
+    endscript
+}
+EOF
+    
+    # 定时任务优化 - 外贸管理系统专用
+    log "配置系统维护任务（外贸管理系统专用）..."
+    cat > /etc/cron.d/morhon-odoo-maintenance << EOF
+# 茂亨Odoo外贸管理系统维护任务
+
+# 每天凌晨2点清理系统缓存（避开工作时间）
+0 2 * * * root sync && echo 3 > /proc/sys/vm/drop_caches
+
+# 每周日凌晨3点清理Docker（周末维护）
+0 3 * * 0 root docker system prune -f --volumes
+
+# 每天凌晨4点备份数据库索引统计
+0 4 * * * root docker exec morhon-odoo-db psql -U odoo -d postgres -c "ANALYZE;" >/dev/null 2>&1
+
+# 每天上午6点检查磁盘空间
+0 6 * * * root df -h | awk '\$5 > 85 {print "Warning: " \$0}' | mail -s "Disk Space Warning" root 2>/dev/null || true
+
+# 每天检查外贸管理系统关键进程
+*/30 * * * * root systemctl is-active docker nginx >/dev/null || systemctl restart docker nginx
+
+# 每周清理Nginx日志（保留30天）
+0 1 * * 1 root find /var/log/nginx/ -name "*.log" -mtime +30 -delete
+
+# 每月第一天清理Redis过期键
+0 5 1 * * root docker exec morhon-odoo-redis redis-cli --scan --pattern "*" | head -1000 | xargs docker exec morhon-odoo-redis redis-cli del >/dev/null 2>&1 || true
+EOF
+    
+    # 禁用不必要的服务（外贸管理系统安全加固）
+    log "禁用不必要的服务（外贸管理系统安全加固）..."
+    local services_to_disable=(
+        "snapd"
+        "bluetooth"
+        "cups"
+        "avahi-daemon"
+        "ModemManager"
+        "whoopsie"
+        "apport"
+        "accounts-daemon"
+        "fwupd"
+        "packagekit"
+    )
+    
+    for service in "${services_to_disable[@]}"; do
+        if systemctl is-enabled "$service" >/dev/null 2>&1; then
+            systemctl disable "$service" >/dev/null 2>&1 || true
+            systemctl stop "$service" >/dev/null 2>&1 || true
+            log "已禁用服务: $service"
+        fi
+    done
+    
+    # 安装并配置安全工具
+    log "安装安全工具..."
+    apt-get install -y fail2ban rkhunter chkrootkit unattended-upgrades
+    
+    # 配置自动安全更新
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << EOF
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
+    "\${distro_id}ESM:\${distro_codename}-infra-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+    
+    # 启用自动更新
+    systemctl enable unattended-upgrades
+    
+    # 配置SSH安全
+    if [ -f "/etc/ssh/sshd_config" ]; then
+        log "加固SSH配置..."
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+        
+        # SSH安全配置
+        sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+        sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
+        sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+        sed -i 's/#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+        
+        # 重启SSH服务
+        systemctl restart sshd
+    fi
+    
+    # 优化启动服务
+    log "优化系统启动..."
+    systemctl enable docker
+    systemctl enable nginx
+    
+    log "专用服务器系统优化完成"
 }
 
 # 安装Docker
@@ -317,9 +567,9 @@ install_docker_compose() {
     log "Docker Compose安装完成"
 }
 
-# 配置防火墙
+# 配置防火墙 - 生产环境安全加固
 configure_firewall() {
-    log "配置防火墙..."
+    log "配置防火墙（生产环境安全加固）..."
     
     # 重置防火墙规则
     ufw --force reset
@@ -328,70 +578,166 @@ configure_firewall() {
     ufw default deny incoming
     ufw default allow outgoing
     
-    # 允许SSH
-    ufw allow 22/tcp
-    log "已允许SSH端口 (22/tcp)"
+    # 允许SSH（限制连接数）
+    ufw limit 22/tcp comment 'SSH with rate limiting'
+    log "已配置SSH端口 (22/tcp) 带连接限制"
     
-    # 允许HTTP
-    ufw allow 80/tcp
+    # 允许HTTP（内网和公网都需要）
+    ufw allow 80/tcp comment 'HTTP for Odoo'
     log "已允许HTTP端口 (80/tcp)"
     
-    # 允许HTTPS
-    ufw allow 443/tcp
+    # 允许HTTPS（公网必需，内网可选）
+    ufw allow 443/tcp comment 'HTTPS for Odoo'
     log "已允许HTTPS端口 (443/tcp)"
+    
+    # 拒绝常见攻击端口（生产环境安全）
+    ufw deny 23/tcp comment 'Block Telnet'
+    ufw deny 135/tcp comment 'Block RPC'
+    ufw deny 139/tcp comment 'Block NetBIOS'
+    ufw deny 445/tcp comment 'Block SMB'
+    ufw deny 1433/tcp comment 'Block MSSQL'
+    ufw deny 3389/tcp comment 'Block RDP'
+    ufw deny 5432/tcp comment 'Block PostgreSQL direct access'
+    ufw deny 6379/tcp comment 'Block Redis direct access'
+    ufw deny 8069/tcp comment 'Block Odoo direct access'
+    ufw deny 8072/tcp comment 'Block Odoo longpolling direct access'
+    
+    # 配置日志记录
+    ufw logging on
     
     # 启用UFW
     ufw --force enable
     
-    log "防火墙配置完成"
+    # 创建fail2ban配置（如果安装了）
+    if command -v fail2ban-server &> /dev/null; then
+        configure_fail2ban
+    else
+        log "建议安装fail2ban增强安全防护"
+    fi
+    
+    log "防火墙配置完成（生产环境安全加固）"
+    log "注意: 已阻止Odoo和数据库的直接访问，仅允许通过Nginx代理"
 }
 
-# 配置Nginx
+# 配置fail2ban（如果可用）
+configure_fail2ban() {
+    log "配置fail2ban..."
+    
+    cat > /etc/fail2ban/jail.d/morhon-odoo.conf << EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 3
+
+[nginx-limit-req]
+enabled = true
+filter = nginx-limit-req
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 10
+EOF
+
+    systemctl restart fail2ban 2>/dev/null || true
+    log "fail2ban配置完成"
+}
+
+# 配置Nginx - 专用服务器优化
 configure_nginx() {
-    log "配置Nginx..."
+    log "配置Nginx（专用服务器优化）..."
     
     # 备份原始配置
     cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
     
-    # 创建优化的nginx配置
+    # 获取系统资源信息
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    
+    # 专用服务器优化参数
+    local worker_processes=$cpu_cores
+    local worker_connections=$((cpu_cores * 2048))  # 每个CPU核心2048连接
+    local worker_rlimit_nofile=$((worker_connections * 2))
+    
+    # 创建专用服务器优化的nginx配置
     tee /etc/nginx/nginx.conf > /dev/null << EOF
+# 茂亨Odoo专用服务器Nginx配置
 user www-data;
-worker_processes auto;
+worker_processes $worker_processes;
+worker_rlimit_nofile $worker_rlimit_nofile;
 pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
 
 events {
-    worker_connections 1024;
+    worker_connections $worker_connections;
     multi_accept on;
     use epoll;
+    accept_mutex off;
 }
 
 http {
     # 基本设置
     sendfile on;
+    sendfile_max_chunk 1m;
     tcp_nopush on;
     tcp_nodelay on;
-    keepalive_timeout 65;
+    keepalive_timeout 75s;
+    keepalive_requests 1000;
     types_hash_max_size 2048;
     server_tokens off;
+    
+    # 专用服务器优化
+    open_file_cache max=10000 inactive=60s;
+    open_file_cache_valid 120s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
     
     # MIME类型
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     
-    # 日志格式
+    # 日志格式优化
     log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
                     '\$status \$body_bytes_sent "\$http_referer" '
-                    '"\$http_user_agent" "\$http_x_forwarded_for"';
+                    '"\$http_user_agent" "\$http_x_forwarded_for" '
+                    'rt=\$request_time uct="\$upstream_connect_time" '
+                    'uht="\$upstream_header_time" urt="\$upstream_response_time"';
     
-    access_log /var/log/nginx/access.log main;
+    access_log /var/log/nginx/access.log main buffer=64k flush=5s;
     error_log /var/log/nginx/error.log warn;
     
-    # 限制请求大小
-    client_max_body_size 100M;
-    client_body_timeout 120s;
+    # 外贸管理系统优化 - 大文件支持
+    client_max_body_size 500M;
+    client_body_buffer_size 128k;
+    client_header_buffer_size 4k;
+    large_client_header_buffers 8 16k;
+    client_body_timeout 300s;
+    client_header_timeout 60s;
+    send_timeout 300s;
     
-    # Gzip压缩
+    # 代理优化
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    proxy_buffer_size 64k;
+    proxy_buffers 32 64k;
+    proxy_busy_buffers_size 128k;
+    proxy_temp_file_write_size 128k;
+    proxy_max_temp_file_size 1024m;
+    
+    # Gzip压缩优化
     gzip on;
     gzip_vary on;
     gzip_proxied any;
@@ -402,25 +748,45 @@ http {
         text/css
         text/xml
         text/javascript
+        text/csv
         application/json
         application/javascript
         application/xml+rss
         application/atom+xml
+        application/rdf+xml
+        application/rss+xml
+        application/geo+json
+        application/ld+json
+        application/manifest+json
+        application/x-web-app-manifest+json
         image/svg+xml;
     
-    # SSL设置
+    # 缓存优化
+    proxy_cache_path /var/cache/nginx/odoo levels=1:2 keys_zone=odoo_cache:100m max_size=1g inactive=60m use_temp_path=off;
+    
+    # SSL优化
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;
     ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_timeout 1d;
     ssl_session_tickets off;
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    
+    # 连接限制 - 外贸管理系统防护
+    limit_conn_zone \$binary_remote_addr zone=conn_limit_per_ip:10m;
+    limit_req_zone \$binary_remote_addr zone=req_limit_per_ip:10m rate=20r/s;
     
     # 包含其他配置
     include /etc/nginx/conf.d/*.conf;
     include /etc/nginx/sites-enabled/*;
 }
 EOF
+    
+    # 创建缓存目录
+    mkdir -p /var/cache/nginx/odoo
+    chown -R www-data:www-data /var/cache/nginx/odoo
     
     # 创建站点目录
     mkdir -p /etc/nginx/sites-available
@@ -432,17 +798,18 @@ EOF
     # 重启Nginx
     systemctl restart nginx
     
-    log "Nginx配置完成"
+    log "Nginx专用服务器配置完成"
 }
 
-# 创建Docker卷
+# 创建Docker卷 - 包含Redis
 create_docker_volumes() {
-    log "创建Docker卷..."
+    log "创建Docker卷（包含Redis缓存）..."
     
     create_volume "$DB_VOLUME_NAME" "数据库卷"
     create_volume "$ODOO_VOLUME_NAME" "Odoo文件卷"
+    create_volume "morhon-redis" "Redis缓存卷"
     
-    log "Docker卷创建完成"
+    log "Docker卷创建完成（包含Redis缓存支持）"
 }
 
 # 创建Docker卷（辅助函数）
@@ -511,32 +878,52 @@ generate_docker_compose() {
     log "配置文件生成完成"
 }
 
-# 计算workers数量
+# 计算workers数量 - 专用服务器优化
 calculate_workers() {
     local cpu_cores="$1"
     local total_mem="$2"
-    local workers=4
+    local workers
     
-    [ "$cpu_cores" -ge 8 ] && workers=8
-    [ "$cpu_cores" -ge 4 ] && workers=6
-    [ "$cpu_cores" -ge 2 ] && workers=4
-    [ "$cpu_cores" -eq 1 ] && workers=2
+    # 专用服务器配置：更激进的worker分配
+    if [ "$cpu_cores" -ge 16 ]; then
+        workers=$((cpu_cores * 2))  # 16核以上：2倍CPU核心数
+    elif [ "$cpu_cores" -ge 8 ]; then
+        workers=$((cpu_cores + 4))  # 8-15核：CPU核心数+4
+    elif [ "$cpu_cores" -ge 4 ]; then
+        workers=$((cpu_cores * 2))  # 4-7核：2倍CPU核心数
+    elif [ "$cpu_cores" -ge 2 ]; then
+        workers=$((cpu_cores + 2))  # 2-3核：CPU核心数+2
+    else
+        workers=3  # 单核：最少3个worker
+    fi
+    
+    # 根据内存限制调整（每个worker大约需要512MB内存）
+    local max_workers_by_mem=$((total_mem * 1024 / 512))
+    [ "$workers" -gt "$max_workers_by_mem" ] && workers="$max_workers_by_mem"
+    
+    # 最少保证4个worker，最多不超过32个
+    [ "$workers" -lt 4 ] && workers=4
+    [ "$workers" -gt 32 ] && workers=32
     
     echo "$workers"
 }
 
-# 创建odoo配置文件
+# 创建odoo配置文件 - 专用服务器优化
 create_odoo_config() {
     local workers="$1"
     local total_mem="$2"
     
-    # 计算内存限制（更保守的设置）
-    local memory_hard=$((total_mem * 200))
-    local memory_soft=$((total_mem * 150))
+    # 外贸管理系统内存分配策略（针对大量产品和订单数据）
+    local memory_hard=$((total_mem * 450))  # 外贸管理系统需要更多内存处理复杂数据
+    local memory_soft=$((total_mem * 350))  # 软限制也相应提高
     
-    # 确保最小值
-    [ "$memory_hard" -lt 512 ] && memory_hard=512
-    [ "$memory_soft" -lt 384 ] && memory_soft=384
+    # 确保最小值（外贸管理系统基础要求）
+    [ "$memory_hard" -lt 1536 ] && memory_hard=1536  # 外贸管理系统最少1.5GB
+    [ "$memory_soft" -lt 1024 ] && memory_soft=1024  # 软限制最少1GB
+    
+    # 数据库连接池优化（外贸管理系统多表关联查询较多）
+    local db_maxconn=$((workers * 4 + 12))  # 外贸管理系统需要更多数据库连接
+    local max_cron_threads=$((workers > 8 ? 6 : workers > 4 ? 4 : 3))  # 更多定时任务处理
     
     cat > "$INSTANCE_DIR/config/odoo.conf" << EOF
 [options]
@@ -547,32 +934,58 @@ data_dir = /var/lib/odoo
 without_demo = all
 proxy_mode = True
 
-# 性能配置
+# 外贸管理系统性能配置
 workers = $workers
 limit_memory_hard = ${memory_hard}M
 limit_memory_soft = ${memory_soft}M
-max_cron_threads = $((workers > 4 ? 2 : 1))
-limit_time_cpu = 600
-limit_time_real = 1200
-limit_request = 8192
+max_cron_threads = $max_cron_threads
+limit_time_cpu = 1800
+limit_time_real = 3600
+limit_request = 32768
 
-# 数据库配置
+# 数据库优化配置（外贸管理系统）
 db_host = db
 db_port = 5432
 db_user = odoo
 db_password = \${DB_PASSWORD}
 db_name = postgres
+db_maxconn = $db_maxconn
 list_db = False
 db_sslmode = prefer
+db_template = template0
+
+# Redis缓存配置 - 外贸管理系统优化
+enable_redis = True
+redis_host = redis
+redis_port = 6379
+redis_db = 0
+redis_pass = False
+redis_expiration = 43200
+
+# 会话管理优化（外贸管理系统用户长时间在线）
+session_redis = True
+session_redis_host = redis
+session_redis_port = 6379
+session_redis_db = 1
+session_redis_prefix = odoo_session
+session_timeout = 28800
+
+# 缓存优化（外贸管理系统大数据量）
+osv_memory_count_limit = 0
+osv_memory_age_limit = 2.0
 
 # 日志配置
 log_level = info
 log_handler = :INFO
 logfile = /var/log/odoo/odoo.log
+log_db = False
+log_db_level = warning
+syslog = False
 
 # 安全配置
 server_wide_modules = base,web
 unaccent = True
+list_db = False
 
 # 邮件配置
 email_from = noreply@localhost
@@ -581,15 +994,92 @@ smtp_port = 25
 smtp_ssl = False
 smtp_user = False
 smtp_password = False
+
+# 外贸管理系统专用优化
+translate_modules = ['all']
+load_language = zh_CN,en_US
+currency_precision = 4
+price_precision = 4
+
+# 报表和导出优化（外贸管理系统单据较多）
+reportgz = True
+csv_internal_sep = ,
+import_partial = 500
+export_partial = 1000
+
+# 外贸管理系统专用缓存策略
+cache_timeout = 1800
+static_cache_timeout = 604800
+
+# 文件上传优化（外贸管理系统文档较大）
+max_file_upload_size = 536870912
+
+# 外贸管理系统业务定时任务优化
+cron_workers = $((max_cron_threads))
+
+# 数据库查询优化
+pg_path = /usr/bin
 EOF
 }
 
-# 创建docker-compose配置文件
+# 创建docker-compose配置文件 - 外贸管理系统优化
 create_docker_compose_config() {
+    # 获取系统资源信息
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    
+    # 外贸管理系统资源分配策略
+    local redis_memory=$((total_mem * 1024))  # Redis使用1GB内存（外贸管理系统缓存需求大）
+    local db_memory="${total_mem}g"
+    local db_shared_buffers=$((total_mem * 256))  # 25% 内存作为shared_buffers
+    local db_effective_cache_size=$((total_mem * 768))  # 75% 内存作为effective_cache_size
+    
     cat > "$INSTANCE_DIR/docker-compose.yml" << EOF
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: morhon-odoo-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory ${redis_memory}mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+      --appendfsync everysec
+      --tcp-keepalive 300
+      --timeout 0
+      --tcp-backlog 511
+      --databases 16
+      --maxclients 10000
+    volumes:
+      - redis-data:/data
+    networks:
+      - morhon-network
+    deploy:
+      resources:
+        limits:
+          memory: ${redis_memory}mb
+          cpus: '1.0'
+        reservations:
+          memory: $((redis_memory / 2))mb
+          cpus: '0.5'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   db:
     image: $POSTGRES_IMAGE
     container_name: morhon-odoo-db
@@ -599,11 +1089,48 @@ services:
       POSTGRES_USER: odoo
       POSTGRES_PASSWORD: \${DB_PASSWORD}
       PGDATA: /var/lib/postgresql/data/pgdata
+      # 外贸管理系统数据库安全配置
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - $DB_VOLUME_NAME:/var/lib/postgresql/data/pgdata
       - $INSTANCE_DIR/backups:/backups
     networks:
       - morhon-network
+    deploy:
+      resources:
+        limits:
+          memory: ${db_memory}
+          cpus: '${cpu_cores}.0'
+        reservations:
+          memory: $((total_mem / 2))g
+          cpus: '$((cpu_cores / 2)).0'
+    security_opt:
+      - no-new-privileges:true
+    # PostgreSQL外贸管理系统优化
+    command: >
+      postgres
+      -c shared_buffers=${db_shared_buffers}MB
+      -c effective_cache_size=${db_effective_cache_size}MB
+      -c maintenance_work_mem=$((total_mem * 64))MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=64MB
+      -c min_wal_size=2GB
+      -c max_wal_size=8GB
+      -c max_worker_processes=$cpu_cores
+      -c max_parallel_workers_per_gather=$((cpu_cores / 2))
+      -c max_parallel_workers=$cpu_cores
+      -c max_parallel_maintenance_workers=$((cpu_cores / 4))
+      -c log_min_duration_statement=1000
+      -c log_checkpoints=on
+      -c log_connections=on
+      -c log_disconnections=on
+      -c log_lock_waits=on
+      -c deadlock_timeout=1s
+      -c max_connections=200
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
       interval: 30s
@@ -618,6 +1145,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       HOST: db
       PORT: 5432
@@ -625,33 +1154,67 @@ services:
       PASSWORD: \${DB_PASSWORD}
       DB_NAME: postgres
       ADMIN_PASSWORD: \${ADMIN_PASSWORD}
+      # Redis缓存配置
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # 外贸管理系统环境变量
+      TZ: Asia/Shanghai
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
     volumes:
       - $INSTANCE_DIR/config/odoo.conf:/etc/odoo/odoo.conf:ro
       - $ODOO_VOLUME_NAME:/var/lib/odoo
       - $INSTANCE_DIR/logs:/var/log/odoo
-      - $INSTANCE_DIR/backups:/backups
+      - $INSTANCE_DIR/backups:/backups:ro
     ports:
       - "127.0.0.1:8069:8069"
       - "127.0.0.1:8072:8072"
     networks:
       - morhon-network
+    deploy:
+      resources:
+        limits:
+          memory: $((total_mem * 2))g
+          cpus: '${cpu_cores}.0'
+        reservations:
+          memory: $((total_mem / 2))g
+          cpus: '$((cpu_cores / 2)).0'
+    security_opt:
+      - no-new-privileges:true
+    # Odoo外贸管理系统优化
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      nproc:
+        soft: 32768
+        hard: 32768
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8069/web/health"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
 
 networks:
   morhon-network:
     driver: bridge
     name: morhon-network
+    driver_opts:
+      com.docker.network.bridge.name: morhon-br0
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
 volumes:
   $DB_VOLUME_NAME:
     external: true
   $ODOO_VOLUME_NAME:
     external: true
+  redis-data:
+    driver: local
+    name: morhon-redis
 EOF
 }
 
@@ -691,7 +1254,7 @@ EOF
     log "管理员密码: $admin_password"
 }
 
-# 创建Nginx域名配置
+# 创建Nginx域名配置 - 公网生产环境优化
 create_nginx_domain_config() {
     local domain="$1"
     local use_www="$2"
@@ -707,75 +1270,144 @@ create_nginx_domain_config() {
     fi
     
     tee "$config_file" > /dev/null << EOF
-# 茂亨Odoo域名模式 - $domain
+# 茂亨Odoo公网生产环境配置 - $domain
 
-# HTTP重定向到HTTPS
+# HTTP重定向到HTTPS（公网安全要求）
 server {
     listen 80;
     listen [::]:80;
     server_name $server_name;
     
+    # 公网连接限制（更严格）
+    limit_conn conn_limit_per_ip 30;
+    limit_req zone=req_limit_per_ip burst=50 nodelay;
+    
     # Certbot验证
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
+        allow all;
     }
     
-    # 重定向到HTTPS
+    # 强制HTTPS重定向
     location / {
         return 301 https://\$server_name\$request_uri;
     }
 }
 
-# HTTPS服务器
+# HTTPS服务器 - 公网生产环境
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name $server_name;
     
-    # SSL证书（Certbot会自动配置）
+    # SSL证书
     ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
     
-    # 安全头部
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
+    # 公网连接和请求限制
+    limit_conn conn_limit_per_ip 30;
+    limit_req zone=req_limit_per_ip burst=50 nodelay;
+    
+    # 公网生产环境安全头部（更严格）
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
     
-    # 代理设置
+    # 代理设置优化
+    proxy_set_header Host \$host;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-Ssl on;
     
-    # 禁止访问数据库管理界面
+    # 代理缓冲优化
+    proxy_buffering on;
+    proxy_buffer_size 64k;
+    proxy_buffers 32 64k;
+    proxy_busy_buffers_size 128k;
+    
+    # 公网环境严格访问控制
     location ~* /(web|api)/database/ {
         deny all;
         return 403;
     }
     
-    # 长轮询请求
+    location ~* /web/static/.*\.(py|pyc|pyo|xml)$ {
+        deny all;
+        return 403;
+    }
+    
+    # 阻止常见攻击路径
+    location ~* \.(git|svn|env|htaccess|htpasswd)$ {
+        deny all;
+        return 403;
+    }
+    
+    # 长轮询请求优化
     location /longpolling {
         proxy_pass http://127.0.0.1:8072;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
     }
     
-    # 静态文件
+    # 静态文件缓存优化 - 公网环境
     location ~* /web/static/ {
-        proxy_buffering on;
-        expires 864000;
         proxy_pass http://127.0.0.1:8069;
+        proxy_cache odoo_cache;
+        proxy_cache_valid 200 302 1d;
+        proxy_cache_valid 404 1m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_lock on;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        add_header X-Cache-Status \$upstream_cache_status;
     }
     
-    # 主请求
+    # 文件上传优化 - 外贸文档支持
+    location ~* /web/binary/ {
+        proxy_pass http://127.0.0.1:8069;
+        client_max_body_size 500M;
+        client_body_buffer_size 128k;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    
+    # 报表和导出优化
+    location ~* /(web/content|report)/ {
+        proxy_pass http://127.0.0.1:8069;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_buffering off;
+    }
+    
+    # API接口优化
+    location ~* /jsonrpc {
+        proxy_pass http://127.0.0.1:8069;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    
+    # 主请求处理
     location / {
         proxy_pass http://127.0.0.1:8069;
         proxy_redirect off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
     }
     
-    access_log /var/log/nginx/morhon-odoo-access.log;
+    # 生产环境日志优化
+    access_log /var/log/nginx/morhon-odoo-access.log main buffer=64k flush=5s;
     error_log /var/log/nginx/morhon-odoo-error.log;
 }
 EOF
@@ -784,60 +1416,123 @@ EOF
     ln -sf "$config_file" "/etc/nginx/sites-enabled/"
     rm -f /etc/nginx/sites-enabled/default
     
-    log "Nginx域名配置创建完成"
+    log "Nginx公网生产环境配置创建完成"
+    log "公网访问地址: https://$domain"
+    log "注意: 这是公网生产环境，已启用严格安全策略"
 }
 
-# 创建Nginx本地配置
+# 创建Nginx本地配置 - 内网生产环境优化
 create_nginx_local_config() {
     local config_file="/etc/nginx/sites-available/morhon-odoo"
     local server_ip=$(get_server_ip)
     
     tee "$config_file" > /dev/null << EOF
-# 茂亨Odoo本地模式 - 通过IP访问
+# 茂亨Odoo内网生产环境配置 - 通过IP访问
 
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     
-    # 安全头部
+    # 内网生产环境连接限制
+    limit_conn conn_limit_per_ip 100;
+    limit_req zone=req_limit_per_ip burst=200 nodelay;
+    
+    # 生产环境安全头部
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
     
-    # 代理设置
+    # 代理设置优化
+    proxy_set_header Host \$host;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Real-IP \$remote_addr;
     
-    # 禁止访问数据库管理界面
+    # 代理缓冲优化
+    proxy_buffering on;
+    proxy_buffer_size 64k;
+    proxy_buffers 32 64k;
+    proxy_busy_buffers_size 128k;
+    
+    # 禁止访问敏感路径（生产环境安全）
     location ~* /(web|api)/database/ {
         deny all;
         return 403;
     }
     
-    # 长轮询请求
+    location ~* /web/static/.*\.(py|pyc|pyo|xml)$ {
+        deny all;
+        return 403;
+    }
+    
+    # 内网IP访问控制（可选配置）
+    # allow 192.168.0.0/16;
+    # allow 10.0.0.0/8;
+    # allow 172.16.0.0/12;
+    # deny all;
+    
+    # 长轮询请求优化
     location /longpolling {
         proxy_pass http://127.0.0.1:8072;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
     }
     
-    # 静态文件
+    # 静态文件缓存优化
     location ~* /web/static/ {
-        proxy_buffering on;
-        expires 864000;
         proxy_pass http://127.0.0.1:8069;
+        proxy_cache odoo_cache;
+        proxy_cache_valid 200 302 1d;
+        proxy_cache_valid 404 1m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_lock on;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        add_header X-Cache-Status \$upstream_cache_status;
     }
     
-    # 主请求
+    # 文件上传优化 - 外贸文档支持
+    location ~* /web/binary/ {
+        proxy_pass http://127.0.0.1:8069;
+        client_max_body_size 500M;
+        client_body_buffer_size 128k;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    
+    # 报表和导出优化
+    location ~* /(web/content|report)/ {
+        proxy_pass http://127.0.0.1:8069;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_buffering off;
+    }
+    
+    # API接口优化
+    location ~* /jsonrpc {
+        proxy_pass http://127.0.0.1:8069;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    
+    # 主请求处理
     location / {
         proxy_pass http://127.0.0.1:8069;
         proxy_redirect off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
     }
     
-    access_log /var/log/nginx/morhon-odoo-access.log;
+    # 生产环境日志优化
+    access_log /var/log/nginx/morhon-odoo-access.log main buffer=64k flush=5s;
     error_log /var/log/nginx/morhon-odoo-error.log;
 }
 EOF
@@ -846,8 +1541,9 @@ EOF
     ln -sf "$config_file" "/etc/nginx/sites-enabled/"
     rm -f /etc/nginx/sites-enabled/default
     
-    log "Nginx本地配置创建完成"
-    log "将通过IP地址访问: http://$server_ip"
+    log "Nginx内网生产环境配置创建完成"
+    log "内网访问地址: http://$server_ip"
+    log "注意: 这是生产环境配置，请确保内网安全策略"
 }
 
 # 获取SSL证书
@@ -1021,6 +1717,9 @@ migrate_manual_instance() {
     # 恢复数据库（如果有备份）
     restore_database_backup "$backup_path"
     
+    # 专用服务器优化
+    optimize_migrated_instance
+    
     # 重启Nginx
     systemctl reload nginx
     
@@ -1028,6 +1727,67 @@ migrate_manual_instance() {
     show_deployment_info "$deployment_type" "$domain" "$backup_path"
     
     return 0
+}
+
+# 迁移实例后的专用服务器优化
+optimize_migrated_instance() {
+    log "执行迁移实例的专用服务器优化..."
+    
+    # 系统优化（如果还没有执行过）
+    if [ ! -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
+        optimize_system_for_odoo
+    fi
+    
+    # 重新生成优化的配置文件
+    log "重新生成优化配置..."
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    local workers=$(calculate_workers "$cpu_cores" "$total_mem")
+    
+    # 更新Odoo配置
+    create_odoo_config "$workers" "$total_mem"
+    
+    # 更新Docker Compose配置
+    create_docker_compose_config
+    
+    # 重启容器以应用新配置
+    cd "$INSTANCE_DIR"
+    docker-compose down
+    docker-compose up -d
+    
+    # 等待服务启动
+    log "等待优化后的服务启动..."
+    sleep 10
+    
+    # 数据库优化
+    optimize_database_after_migration
+    
+    log "迁移实例专用服务器优化完成"
+}
+
+# 迁移后数据库优化
+optimize_database_after_migration() {
+    log "执行数据库优化..."
+    
+    # 等待数据库完全启动
+    local db_ready=false
+    for i in {1..30}; do
+        if docker-compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
+            db_ready=true
+            break
+        fi
+        sleep 2
+    done
+    
+    if [ "$db_ready" = true ]; then
+        # 执行数据库维护
+        log "执行数据库维护操作..."
+        docker-compose exec -T db psql -U odoo -d postgres -c "VACUUM ANALYZE;" >/dev/null 2>&1 || true
+        docker-compose exec -T db psql -U odoo -d postgres -c "REINDEX DATABASE postgres;" >/dev/null 2>&1 || true
+        log "数据库优化完成"
+    else
+        log_warn "数据库未能及时启动，跳过数据库优化"
+    fi
 }
 
 # 确认操作
@@ -1192,15 +1952,26 @@ show_deployment_info() {
     local domain="$2"
     local backup_path="$3"
     
+    echo ""
+    echo -e "${GREEN}部署完成！${NC}"
+    echo "===================="
     log "实例目录: $INSTANCE_DIR"
-    log "备份文件: $backup_path"
+    [ -n "$backup_path" ] && log "备份文件: $backup_path"
     
     if [ "$deployment_type" = "domain" ]; then
-        log "访问地址: https://$domain"
+        log "公网访问地址: https://$domain"
+        log "部署环境: 公网生产环境"
     else
         local server_ip=$(get_server_ip)
-        log "访问地址: http://$server_ip"
+        log "内网访问地址: http://$server_ip"
+        log "部署环境: 内网生产环境"
     fi
+    
+    echo ""
+    echo -e "${YELLOW}重要提醒:${NC}"
+    echo "• 这是生产环境部署，请妥善保管管理员密码"
+    echo "• 建议定期备份数据和配置文件"
+    echo "• 如需技术支持，请访问: https://github.com/morhon-tech/morhon-odoo"
 }
 
 # 从本地备份恢复
@@ -1279,6 +2050,22 @@ restore_from_backup() {
     
     # 恢复数据库
     restore_from_backup_file "$backup_data"
+    
+    # 恢复Redis缓存（如果存在）
+    local redis_backup=$(find "$temp_dir" -name "redis-dump.rdb" -type f | head -1)
+    if [ -n "$redis_backup" ] && [ -f "$redis_backup" ]; then
+        log "恢复Redis缓存..."
+        # 等待Redis容器启动
+        sleep 5
+        if docker cp "$redis_backup" morhon-odoo-redis:/data/dump.rdb 2>/dev/null; then
+            docker-compose restart redis >/dev/null 2>&1 || true
+            log "Redis缓存恢复完成"
+        else
+            log_warn "Redis缓存恢复失败，系统将自动重建缓存"
+        fi
+    else
+        log "未找到Redis备份文件，系统将自动重建缓存"
+    fi
     
     # 恢复其他配置（如果存在）
     restore_additional_configs "$temp_dir"
@@ -1391,20 +2178,43 @@ get_restore_deployment_info() {
     local -n use_www_ref=$3
     
     echo ""
-    echo "请输入域名（直接回车将使用本地模式）:"
-    read -p "域名: " domain_ref
+    echo -e "${CYAN}选择恢复部署模式:${NC}"
+    echo "1) 内网模式 - 恢复到内网环境，通过IP访问（生产环境）"
+    echo "2) 公网模式 - 恢复到公网VPS，通过域名访问（生产环境）"
+    echo ""
+    read -p "请选择部署模式 (1-2): " deploy_mode
     
-    deployment_type_ref="local"
-    use_www_ref="no"
-    
-    if [ -n "$domain_ref" ]; then
-        deployment_type_ref="domain"
-        # 自动检测是否带www
-        if [[ "$domain_ref" == www.* ]]; then
-            use_www_ref="yes"
-        fi
-        # 原手动选择已替换为自动检测
-    fi
+    case $deploy_mode in
+        1)
+            deployment_type_ref="local"
+            domain_ref=""
+            use_www_ref="no"
+            log "选择恢复到内网生产环境"
+            ;;
+        2)
+            deployment_type_ref="domain"
+            echo ""
+            read -p "请输入域名: " domain_ref
+            if [ -z "$domain_ref" ]; then
+                log_error "域名不能为空"
+                deployment_type_ref="local"
+                domain_ref=""
+                use_www_ref="no"
+            else
+                # 自动检测是否带www
+                if [[ "$domain_ref" == www.* ]]; then
+                    use_www_ref="yes"
+                fi
+                log "选择恢复到公网生产环境，域名: $domain_ref"
+            fi
+            ;;
+        *)
+            log "无效选择，默认恢复到内网模式"
+            deployment_type_ref="local"
+            domain_ref=""
+            use_www_ref="no"
+            ;;
+    esac
 }
 
 # 从备份文件恢复数据库
@@ -1453,20 +2263,43 @@ get_deployment_info_interactive() {
     local -n use_www_ref=$3
     
     echo ""
-    echo "请输入域名（直接回车将使用本地模式）:"
-    read -p "域名: " domain_ref
+    echo -e "${CYAN}选择部署模式:${NC}"
+    echo "1) 内网模式 - 部署在内网环境，通过IP访问（生产环境）"
+    echo "2) 公网模式 - 部署在公网VPS，通过域名访问（生产环境）"
+    echo ""
+    read -p "请选择部署模式 (1-2): " deploy_mode
     
-    deployment_type_ref="local"
-    use_www_ref="no"
-    
-    if [ -n "$domain_ref" ]; then
-        deployment_type_ref="domain"
-        # 自动检测是否带www
-        if [[ "$domain_ref" == www.* ]]; then
-            use_www_ref="yes"
-        fi
-        # 原手动选择已替换为自动检测
-    fi
+    case $deploy_mode in
+        1)
+            deployment_type_ref="local"
+            domain_ref=""
+            use_www_ref="no"
+            log "选择内网生产环境模式"
+            ;;
+        2)
+            deployment_type_ref="domain"
+            echo ""
+            read -p "请输入域名: " domain_ref
+            if [ -z "$domain_ref" ]; then
+                log_error "域名不能为空"
+                deployment_type_ref="local"
+                domain_ref=""
+                use_www_ref="no"
+            else
+                # 自动检测是否带www
+                if [[ "$domain_ref" == www.* ]]; then
+                    use_www_ref="yes"
+                fi
+                log "选择公网生产环境模式，域名: $domain_ref"
+            fi
+            ;;
+        *)
+            log "无效选择，默认使用内网模式"
+            deployment_type_ref="local"
+            domain_ref=""
+            use_www_ref="no"
+            ;;
+    esac
 }
 
 # 检查并初始化环境
@@ -1484,7 +2317,7 @@ manage_script_instance() {
     local choice
     while true; do
         show_management_menu
-        read -p "请选择操作 (1-7): " choice
+        read -p "请选择操作 (1-8): " choice
         
         case $choice in
             1) show_instance_status ;;
@@ -1493,11 +2326,12 @@ manage_script_instance() {
             4) backup_instance ;;
             5) modify_config ;;
             6) check_system_status ;;
-            7) return 1 ;;  # 返回主菜单
+            7) optimize_existing_instance ;;
+            8) return 1 ;;  # 返回主菜单
             *) log_error "无效选择" ;;
         esac
         
-        [ "$choice" -eq 7 ] && break
+        [ "$choice" -eq 8 ] && break
         echo ""
         read -p "按回车键继续..."
     done
@@ -1517,20 +2351,23 @@ show_management_menu() {
     echo "4) 备份实例"
     echo "5) 修改配置"
     echo "6) 系统状态检查"
-    echo "7) 返回主菜单"
+    echo "7) 性能优化"
+    echo "8) 返回主菜单"
     echo ""
 }
 
-# 系统状态检查
+# 系统状态检查 - 专用服务器监控
 check_system_status() {
     echo ""
-    echo -e "${CYAN}系统状态检查${NC}"
-    echo "===================="
+    echo -e "${CYAN}茂亨Odoo专用服务器状态检查${NC}"
+    echo "================================================"
     
     # 检查Docker状态
     echo -e "\n${YELLOW}Docker状态:${NC}"
     if systemctl is-active --quiet docker; then
         echo "✓ Docker服务运行正常"
+        local docker_version=$(docker --version | cut -d' ' -f3 | cut -d',' -f1)
+        echo "  版本: $docker_version"
     else
         echo "✗ Docker服务未运行"
     fi
@@ -1539,36 +2376,118 @@ check_system_status() {
     echo -e "\n${YELLOW}Nginx状态:${NC}"
     if systemctl is-active --quiet nginx; then
         echo "✓ Nginx服务运行正常"
+        local nginx_version=$(nginx -v 2>&1 | cut -d'/' -f2)
+        echo "  版本: $nginx_version"
+        
+        # 检查Nginx配置
+        if nginx -t >/dev/null 2>&1; then
+            echo "✓ Nginx配置语法正确"
+        else
+            echo "✗ Nginx配置存在错误"
+        fi
     else
         echo "✗ Nginx服务未运行"
     fi
     
     # 检查容器状态
     echo -e "\n${YELLOW}容器状态:${NC}"
-    cd "$INSTANCE_DIR"
-    docker-compose ps
+    if [ -f "$INSTANCE_DIR/docker-compose.yml" ]; then
+        cd "$INSTANCE_DIR"
+        docker-compose ps
+        
+        # 检查容器资源使用
+        echo -e "\n${YELLOW}容器资源使用:${NC}"
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" morhon-odoo morhon-odoo-db morhon-odoo-redis 2>/dev/null || echo "无法获取容器统计信息"
+        
+        # Redis缓存状态检查
+        echo -e "\n${YELLOW}Redis缓存状态:${NC}"
+        if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
+            echo "✓ Redis服务运行正常"
+            
+            # Redis内存使用
+            local redis_memory=$(docker exec morhon-odoo-redis redis-cli info memory 2>/dev/null | grep "used_memory_human:" | cut -d':' -f2 | tr -d '\r')
+            local redis_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
+            local redis_hits=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
+            local redis_misses=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
+            
+            echo "  内存使用: $redis_memory"
+            echo "  缓存键数: $redis_keys"
+            
+            if [ -n "$redis_hits" ] && [ -n "$redis_misses" ] && [ "$redis_hits" -gt 0 ] && [ "$redis_misses" -gt 0 ]; then
+                local hit_rate=$(( redis_hits * 100 / (redis_hits + redis_misses) ))
+                echo "  命中率: ${hit_rate}%"
+                
+                if [ "$hit_rate" -lt 70 ]; then
+                    echo "  ⚠ 缓存命中率较低，建议检查缓存策略"
+                elif [ "$hit_rate" -gt 90 ]; then
+                    echo "  ✓ 缓存命中率优秀"
+                else
+                    echo "  ✓ 缓存命中率良好"
+                fi
+            fi
+        else
+            echo "✗ Redis服务未运行"
+        fi
+    else
+        echo "未找到Docker Compose配置文件"
+    fi
     
-    # 检查端口占用
+    # 检查端口状态
     echo -e "\n${YELLOW}端口状态:${NC}"
-    if netstat -tlnp | grep -q ":8069"; then
-        echo "✓ 端口8069已监听"
-    else
-        echo "✗ 端口8069未监听"
-    fi
+    local ports=("80:HTTP" "443:HTTPS" "8069:Odoo" "8072:Longpolling" "6379:Redis")
+    for port_info in "${ports[@]}"; do
+        local port=$(echo "$port_info" | cut -d':' -f1)
+        local service=$(echo "$port_info" | cut -d':' -f2)
+        if [ "$port" = "6379" ]; then
+            # Redis端口只在容器内部，检查容器是否运行
+            if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
+                echo "✓ 端口$port ($service) 容器内运行正常"
+            else
+                echo "✗ 端口$port ($service) 容器未运行"
+            fi
+        else
+            if netstat -tlnp | grep -q ":$port "; then
+                echo "✓ 端口$port ($service) 已监听"
+            else
+                echo "✗ 端口$port ($service) 未监听"
+            fi
+        fi
+    done
     
-    if netstat -tlnp | grep -q ":8072"; then
-        echo "✓ 端口8072已监听"
-    else
-        echo "✗ 端口8072未监听"
-    fi
+    # 系统资源监控
+    echo -e "\n${YELLOW}系统资源:${NC}"
     
-    # 检查磁盘空间
+    # CPU信息
+    local cpu_cores=$(nproc)
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+    echo "CPU: ${cpu_cores}核心, 使用率: ${cpu_usage}%"
+    
+    # 内存使用
+    local mem_info=$(free -h | grep "Mem:")
+    local mem_total=$(echo "$mem_info" | awk '{print $2}')
+    local mem_used=$(echo "$mem_info" | awk '{print $3}')
+    local mem_percent=$(free | grep "Mem:" | awk '{printf "%.1f", $3/$2 * 100.0}')
+    echo "内存: ${mem_used}/${mem_total} (${mem_percent}% 已使用)"
+    
+    # 磁盘空间
     echo -e "\n${YELLOW}磁盘空间:${NC}"
     df -h / | tail -1 | awk '{print "根分区: " $3 "/" $2 " (" $5 " 已使用)"}'
     
-    # 检查内存使用
-    echo -e "\n${YELLOW}内存使用:${NC}"
-    free -h | grep "Mem:" | awk '{print "内存: " $3 "/" $2 " (" int($3/$2*100) "% 已使用)"}'
+    # Docker卷空间
+    if command -v docker &> /dev/null; then
+        local docker_space=$(docker system df --format "table {{.Type}}\t{{.TotalCount}}\t{{.Size}}" 2>/dev/null | grep -E "Images|Containers|Local Volumes" || echo "无法获取Docker空间信息")
+        echo -e "\n${YELLOW}Docker存储:${NC}"
+        echo "$docker_space"
+    fi
+    
+    # 网络连接统计
+    echo -e "\n${YELLOW}网络连接:${NC}"
+    local connections=$(netstat -an | grep -E ":80|:443|:8069|:8072" | wc -l)
+    echo "活跃连接数: $connections"
+    
+    # 负载平均值
+    local load_avg=$(uptime | awk -F'load average:' '{print $2}')
+    echo "系统负载:$load_avg"
     
     # 检查SSL证书（如果是域名模式）
     if [ -f "$INSTANCE_DIR/.env" ]; then
@@ -1577,10 +2496,121 @@ check_system_status() {
             echo -e "\n${YELLOW}SSL证书状态:${NC}"
             if [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
                 local cert_expiry=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$domain/fullchain.pem" | cut -d= -f2)
+                local days_left=$(( ($(date -d "$cert_expiry" +%s) - $(date +%s)) / 86400 ))
                 echo "✓ SSL证书存在，到期时间: $cert_expiry"
+                if [ "$days_left" -lt 30 ]; then
+                    echo "⚠ 警告: SSL证书将在 $days_left 天后过期"
+                else
+                    echo "✓ SSL证书有效期充足 ($days_left 天)"
+                fi
             else
                 echo "✗ SSL证书不存在"
             fi
+        fi
+    fi
+    
+    # 系统优化状态检查
+    echo -e "\n${YELLOW}系统优化状态:${NC}"
+    
+    # 检查内核参数优化
+    if [ -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
+        echo "✓ 内核参数已优化"
+    else
+        echo "✗ 内核参数未优化"
+    fi
+    
+    # 检查系统限制优化
+    if [ -f "/etc/security/limits.d/99-morhon-odoo.conf" ]; then
+        echo "✓ 系统限制已优化"
+    else
+        echo "✗ 系统限制未优化"
+    fi
+    
+    # 检查Docker优化
+    if [ -f "/etc/docker/daemon.json" ]; then
+        echo "✓ Docker配置已优化"
+    else
+        echo "✗ Docker配置未优化"
+    fi
+    
+    # 外贸系统安全检查
+    echo -e "\n${YELLOW}外贸系统安全状态:${NC}"
+    
+    # 检查防火墙状态
+    if ufw status | grep -q "Status: active"; then
+        echo "✓ 防火墙已启用"
+        local blocked_ports=$(ufw status | grep -c "DENY")
+        echo "  已阻止 $blocked_ports 个危险端口"
+    else
+        echo "✗ 防火墙未启用"
+    fi
+    
+    # 检查fail2ban状态
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo "✓ fail2ban入侵防护已启用"
+        local banned_ips=$(fail2ban-client status 2>/dev/null | grep -o "Jail list:.*" | wc -w)
+        [ "$banned_ips" -gt 2 ] && echo "  监控 $((banned_ips - 2)) 个服务"
+    else
+        echo "⚠ fail2ban未安装或未启用"
+    fi
+    
+    # 检查数据库安全
+    if docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT version();" >/dev/null 2>&1; then
+        echo "✓ 数据库连接安全"
+        local db_connections=$(docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | grep -E "^\s*[0-9]+\s*$" | tr -d ' ')
+        [ -n "$db_connections" ] && echo "  当前连接数: $db_connections"
+    else
+        echo "✗ 数据库连接异常"
+    fi
+    
+    # 外贸系统性能建议
+    echo -e "\n${YELLOW}外贸系统性能建议:${NC}"
+    
+    # CPU使用率建议
+    if (( $(echo "$cpu_usage > 80" | bc -l) )); then
+        echo "⚠ CPU使用率较高，建议检查Odoo worker配置或升级CPU"
+    fi
+    
+    # 内存使用建议
+    if (( $(echo "$mem_percent > 85" | bc -l) )); then
+        echo "⚠ 内存使用率较高，建议优化Odoo内存配置或增加内存"
+    fi
+    
+    # 磁盘空间建议
+    local disk_usage=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+    if [ "$disk_usage" -gt 85 ]; then
+        echo "⚠ 磁盘空间不足，建议清理日志和备份文件"
+    fi
+    
+    # Redis缓存建议
+    if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
+        local redis_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
+        local redis_hits=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
+        local redis_misses=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
+        
+        if [ -n "$redis_hits" ] && [ -n "$redis_misses" ] && [ "$redis_hits" -gt 0 ] && [ "$redis_misses" -gt 0 ]; then
+            local hit_rate=$(( redis_hits * 100 / (redis_hits + redis_misses) ))
+            if [ "$hit_rate" -lt 70 ]; then
+                echo "⚠ Redis缓存命中率较低($hit_rate%)，建议优化缓存策略"
+            fi
+        fi
+        
+        if [ "$redis_keys" -gt 100000 ]; then
+            echo "⚠ Redis缓存键数量较多($redis_keys)，建议定期清理过期缓存"
+        fi
+    fi
+    
+    # 外贸业务专用建议
+    local current_hour=$(date +%H)
+    if [ "$current_hour" -ge 9 ] && [ "$current_hour" -le 18 ]; then
+        echo "💡 当前为工作时间，建议避免进行系统维护操作"
+    fi
+    
+    # 数据库连接建议
+    if docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" >/dev/null 2>&1; then
+        local db_connections=$(docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | grep -E "^\s*[0-9]+\s*$" | tr -d ' ')
+        if [ -n "$db_connections" ] && [ "$db_connections" -gt 150 ]; then
+            echo "⚠ 数据库连接数较多($db_connections)，建议检查连接池配置"
         fi
     fi
     
@@ -1595,7 +2625,7 @@ show_instance_status() {
     docker-compose ps
     echo ""
     echo -e "${CYAN}卷状态:${NC}"
-    docker volume ls | grep -E "($DB_VOLUME_NAME|$ODOO_VOLUME_NAME)"
+    docker volume ls | grep -E "($DB_VOLUME_NAME|$ODOO_VOLUME_NAME|morhon-redis)"
 }
 
 # 重启实例
@@ -1643,6 +2673,15 @@ backup_instance() {
         return 1
     fi
     
+    # 备份Redis缓存数据
+    log "备份Redis缓存..."
+    if docker-compose exec -T redis redis-cli --rdb /data/dump.rdb >/dev/null 2>&1; then
+        docker cp morhon-odoo-redis:/data/dump.rdb "$backup_path/redis-dump.rdb" 2>/dev/null || log_warn "Redis备份复制失败"
+        log "Redis缓存备份完成"
+    else
+        log_warn "Redis缓存备份失败，继续其他备份"
+    fi
+    
     # 备份配置文件
     log "备份配置文件..."
     cp -r "$INSTANCE_DIR/config" "$backup_path/" 2>/dev/null || true
@@ -1661,10 +2700,11 @@ backup_instance() {
 备份时间: $(date '+%Y-%m-%d %H:%M:%S')
 脚本版本: 6.2
 实例目录: $INSTANCE_DIR
-备份类型: 完整备份
+备份类型: 完整备份（包含Redis缓存）
 
 包含内容:
 - 数据库完整备份 (database.sql.gz)
+- Redis缓存备份 (redis-dump.rdb)
 - Odoo配置文件 (config/)
 - Docker Compose配置 (docker-compose.yml)
 - 环境变量 (.env)
@@ -1674,6 +2714,10 @@ backup_instance() {
 1. 解压备份文件
 2. 运行脚本选择"从本地备份恢复"
 3. 选择此备份文件
+
+注意事项:
+- Redis缓存会在系统启动后自动重建
+- 如果Redis备份文件不存在，不影响系统正常运行
 EOF
     
     # 打包备份
@@ -1699,12 +2743,14 @@ modify_config() {
     echo "1) 修改管理员密码"
     echo "2) 修改数据库密码"
     echo "3) 修改Nginx配置"
-    read -p "选择操作 (1-3): " config_choice
+    echo "4) Redis缓存管理"
+    read -p "选择操作 (1-4): " config_choice
     
     case $config_choice in
         1) update_admin_password ;;
         2) update_db_password ;;
         3) update_nginx_config ;;
+        4) manage_redis_cache ;;
         *) log_error "无效选择" ;;
     esac
 }
@@ -1730,6 +2776,240 @@ update_nginx_config() {
     nano /etc/nginx/sites-available/morhon-odoo
     nginx -t && systemctl reload nginx
     log "Nginx配置已更新"
+}
+
+# Redis缓存管理
+manage_redis_cache() {
+    echo ""
+    echo -e "${CYAN}Redis缓存管理${NC}"
+    echo "=================="
+    
+    if ! docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
+        echo "Redis服务未运行"
+        return 1
+    fi
+    
+    echo "1) 查看缓存统计"
+    echo "2) 清空所有缓存"
+    echo "3) 清空会话缓存"
+    echo "4) 查看缓存配置"
+    echo "5) 返回"
+    read -p "选择操作 (1-5): " redis_choice
+    
+    case $redis_choice in
+        1) show_redis_stats ;;
+        2) clear_all_cache ;;
+        3) clear_session_cache ;;
+        4) show_redis_config ;;
+        5) return ;;
+        *) log_error "无效选择" ;;
+    esac
+}
+
+# 显示Redis统计信息
+show_redis_stats() {
+    echo ""
+    echo -e "${YELLOW}Redis缓存统计:${NC}"
+    
+    local redis_info=$(docker exec morhon-odoo-redis redis-cli info 2>/dev/null)
+    
+    # 内存使用
+    local used_memory=$(echo "$redis_info" | grep "used_memory_human:" | cut -d':' -f2 | tr -d '\r')
+    local used_memory_peak=$(echo "$redis_info" | grep "used_memory_peak_human:" | cut -d':' -f2 | tr -d '\r')
+    echo "内存使用: $used_memory (峰值: $used_memory_peak)"
+    
+    # 键统计
+    local total_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
+    echo "总键数: $total_keys"
+    
+    # 命中率统计
+    local hits=$(echo "$redis_info" | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
+    local misses=$(echo "$redis_info" | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
+    
+    if [ -n "$hits" ] && [ -n "$misses" ] && [ "$hits" -gt 0 ] && [ "$misses" -gt 0 ]; then
+        local hit_rate=$(( hits * 100 / (hits + misses) ))
+        echo "缓存命中: $hits 次"
+        echo "缓存未命中: $misses 次"
+        echo "命中率: ${hit_rate}%"
+    fi
+    
+    # 连接数
+    local connected_clients=$(echo "$redis_info" | grep "connected_clients:" | cut -d':' -f2 | tr -d '\r')
+    echo "连接客户端: $connected_clients"
+    
+    # 各数据库键数
+    echo ""
+    echo "各数据库键数:"
+    for db in {0..15}; do
+        local db_keys=$(docker exec morhon-odoo-redis redis-cli -n $db dbsize 2>/dev/null | tr -d '\r')
+        if [ "$db_keys" -gt 0 ]; then
+            case $db in
+                0) echo "  DB$db (应用缓存): $db_keys 键" ;;
+                1) echo "  DB$db (会话数据): $db_keys 键" ;;
+                *) echo "  DB$db: $db_keys 键" ;;
+            esac
+        fi
+    done
+}
+
+# 清空所有缓存
+clear_all_cache() {
+    echo ""
+    echo "⚠️  警告: 此操作将清空所有Redis缓存数据"
+    read -p "确认清空所有缓存？(y/N): " confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker exec morhon-odoo-redis redis-cli flushall >/dev/null 2>&1
+        log "所有缓存已清空"
+        echo "系统将自动重建缓存，可能会暂时影响性能"
+    else
+        log "取消操作"
+    fi
+}
+
+# 清空会话缓存
+clear_session_cache() {
+    echo ""
+    echo "清空会话缓存将导致所有用户需要重新登录"
+    read -p "确认清空会话缓存？(y/N): " confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        docker exec morhon-odoo-redis redis-cli -n 1 flushdb >/dev/null 2>&1
+        log "会话缓存已清空"
+        echo "所有用户需要重新登录"
+    else
+        log "取消操作"
+    fi
+}
+
+# 显示Redis配置
+show_redis_config() {
+    echo ""
+    echo -e "${YELLOW}Redis配置信息:${NC}"
+    
+    local redis_config=$(docker exec morhon-odoo-redis redis-cli config get "*" 2>/dev/null)
+    
+    echo "最大内存: $(docker exec morhon-odoo-redis redis-cli config get maxmemory 2>/dev/null | tail -1 | tr -d '\r') bytes"
+    echo "内存策略: $(docker exec morhon-odoo-redis redis-cli config get maxmemory-policy 2>/dev/null | tail -1 | tr -d '\r')"
+    echo "持久化: $(docker exec morhon-odoo-redis redis-cli config get save 2>/dev/null | tail -1 | tr -d '\r')"
+    echo "AOF: $(docker exec morhon-odoo-redis redis-cli config get appendonly 2>/dev/null | tail -1 | tr -d '\r')"
+    
+    local redis_version=$(docker exec morhon-odoo-redis redis-cli info server 2>/dev/null | grep "redis_version:" | cut -d':' -f2 | tr -d '\r')
+    echo "Redis版本: $redis_version"
+}
+
+# 优化现有实例
+optimize_existing_instance() {
+    echo ""
+    echo -e "${CYAN}茂亨Odoo专用服务器优化${NC}"
+    echo "================================"
+    echo ""
+    echo "此操作将对现有实例进行全面优化："
+    echo "• 系统内核参数优化"
+    echo "• Docker配置优化"
+    echo "• Nginx配置优化"
+    echo "• Odoo配置优化"
+    echo "• 数据库性能优化"
+    echo ""
+    
+    if ! confirm_action "确认执行专用服务器优化？这将重启相关服务"; then
+        log "取消优化操作"
+        return 1
+    fi
+    
+    log "开始优化现有实例..."
+    
+    # 1. 系统优化
+    if [ ! -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
+        log "执行系统优化..."
+        optimize_system_for_odoo
+    else
+        log "系统优化已存在，跳过"
+    fi
+    
+    # 2. 重新生成优化配置
+    log "重新生成优化配置..."
+    local cpu_cores=$(nproc)
+    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    local workers=$(calculate_workers "$cpu_cores" "$total_mem")
+    
+    # 备份现有配置
+    local backup_suffix=$(date '+%Y%m%d_%H%M%S')
+    cp "$INSTANCE_DIR/config/odoo.conf" "$INSTANCE_DIR/config/odoo.conf.backup.$backup_suffix" 2>/dev/null || true
+    cp "$INSTANCE_DIR/docker-compose.yml" "$INSTANCE_DIR/docker-compose.yml.backup.$backup_suffix" 2>/dev/null || true
+    
+    # 生成新的优化配置
+    create_odoo_config "$workers" "$total_mem"
+    create_docker_compose_config
+    
+    # 3. 优化Nginx配置
+    log "优化Nginx配置..."
+    configure_nginx
+    
+    # 检查当前部署类型
+    local deployment_type="local"
+    local domain=""
+    local use_www="no"
+    
+    if [ -f "$INSTANCE_DIR/.env" ]; then
+        domain=$(grep "^DOMAIN=" "$INSTANCE_DIR/.env" | cut -d'=' -f2 2>/dev/null || echo "")
+        if [ -n "$domain" ] && [ "$domain" != "" ]; then
+            deployment_type="domain"
+            if [[ "$domain" == www.* ]]; then
+                use_www="yes"
+            fi
+        fi
+    fi
+    
+    # 重新生成Nginx站点配置
+    if [ "$deployment_type" = "domain" ]; then
+        create_nginx_domain_config "$domain" "$use_www"
+    else
+        create_nginx_local_config
+    fi
+    
+    # 4. 重启服务应用优化
+    log "重启服务应用优化配置..."
+    cd "$INSTANCE_DIR"
+    
+    # 停止服务
+    docker-compose down
+    
+    # 重启Docker服务以应用新配置
+    systemctl restart docker
+    sleep 5
+    
+    # 启动优化后的服务
+    docker-compose up -d
+    
+    # 重启Nginx
+    systemctl restart nginx
+    
+    # 5. 等待服务启动并进行数据库优化
+    log "等待服务启动..."
+    sleep 15
+    
+    # 数据库优化
+    optimize_database_after_migration
+    
+    # 6. 显示优化结果
+    echo ""
+    echo -e "${GREEN}优化完成！${NC}"
+    echo "===================="
+    echo "优化内容："
+    echo "• CPU核心数: $cpu_cores"
+    echo "• 内存总量: ${total_mem}GB"
+    echo "• Odoo Workers: $workers"
+    echo "• 部署模式: $deployment_type"
+    [ -n "$domain" ] && echo "• 域名: $domain"
+    echo ""
+    echo "配置备份："
+    echo "• Odoo配置: $INSTANCE_DIR/config/odoo.conf.backup.$backup_suffix"
+    echo "• Docker配置: $INSTANCE_DIR/docker-compose.yml.backup.$backup_suffix"
+    echo ""
+    echo "建议执行系统状态检查验证优化效果"
+    
+    return 0
 }
 
 # 显示主菜单
@@ -1810,7 +3090,7 @@ show_container_info() {
 show_no_instance_menu() {
     echo -e "${BLUE}○ 未检测到现有实例${NC}"
     echo ""
-    echo "1) 全新部署"
+    echo "1) 全新部署（内网生产环境或公网生产环境）"
     echo "2) 从备份恢复"
     echo "3) 退出"
     echo ""
@@ -1886,14 +3166,30 @@ if [ $# -ge 1 ]; then
             echo "  status     显示实例状态"
             echo "  help       显示此帮助信息"
             echo ""
+            echo "部署模式:"
+            echo "  • 本地模式: 部署在内网环境，通过服务器IP访问（强烈推荐）"
+            echo "    - 适用场景: 企业内网、局域网环境"
+            echo "    - 访问方式: http://服务器IP"
+            echo "    - 优势: 访问速度快，安全性高，维护简单"
+            echo ""
+            echo "  • 二级域名模式: 通过二级域名访问，专用于企业管理（推荐）"
+            echo "    - 适用场景: 远程办公、多地分支"
+            echo "    - 访问方式: https://erp.company.com"
+            echo "    - 优势: 专业性强，便于管理，安全可控"
+            echo ""
+            echo "  • 主域名模式: 通过主域名访问（不推荐，与网站功能冲突）"
+            echo "    - 说明: 虽然支持但不推荐用于网站功能"
+            echo "    - 原因: 服务器位置无法同时优化企业管理和网站访问"
+            echo ""
             echo "功能特性:"
             echo "  • 单实例部署设计，确保系统稳定性"
             echo "  • 自动检测现有实例（脚本管理/手动部署）"
-            echo "  • 支持本地模式和域名模式部署"
-            echo "  • 自动SSL证书获取和续期"
+            echo "  • 支持内网生产环境和公网生产环境部署"
+            echo "  • 自动SSL证书获取和续期（公网模式）"
             echo "  • 完整的备份和恢复功能"
             echo "  • 手动实例迁移到脚本管理"
-            echo "  • 性能优化和安全加固"
+            echo "  • 外贸业务性能优化和安全加固"
+            echo "  • Redis缓存加速和会话管理"
             echo "  • 健康检查和状态监控"
             echo "  • Docker卷映射，防止插件冲突"
             echo ""
@@ -1901,14 +3197,12 @@ if [ $# -ge 1 ]; then
             echo "  1. 检测现有实例类型"
             echo "  2. 脚本实例 → 管理菜单（状态、备份、配置等）"
             echo "  3. 手动实例 → 迁移菜单（迁移到脚本管理）"
-            echo "  4. 无实例 → 全新部署菜单"
-            echo ""
-            echo "部署模式:"
-            echo "  • 本地模式: 通过服务器IP访问，HTTP协议"
-            echo "  • 域名模式: 通过域名访问，自动HTTPS"
+            echo "  4. 无实例 → 全新部署菜单（选择内网或公网模式）"
             echo ""
             echo "重要说明:"
-            echo "  • 单实例设计：一台服务器只能部署一个实例"
+            echo "  • 推荐使用本地部署或二级域名部署"
+            echo "  • 专注于企业管理功能，不推荐使用网站功能"
+            echo "  • 网站功能建议使用WordPress等专业系统"
             echo "  • 数据卷映射：防止用户误操作和插件冲突"
             echo "  • 禁止自装插件：避免系统不稳定和安全风险"
             echo ""
