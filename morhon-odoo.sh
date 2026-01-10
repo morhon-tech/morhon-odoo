@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# 茂亨Odoo外贸专用版管理脚本 - 优化版
+# 茂亨Odoo外贸专用版管理脚本 - Ubuntu专用版
 # 单实例版本，支持本地模式和域名模式
 # 版本: 6.2
+# 系统要求: 推荐Ubuntu 24.04 LTS，支持20.04+ LTS
 # GitHub: https://github.com/morhon-tech/morhon-odoo
 # 
 # 功能特性:
@@ -13,6 +14,7 @@
 # - 手动实例迁移到脚本管理
 # - 性能优化配置
 # - 安全加固设置
+# - 仅支持Ubuntu系统，确保最佳兼容性
 
 set -e
 
@@ -61,6 +63,62 @@ log_info() {
 
 log_warn() {
     echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
+}
+
+# 检查系统兼容性 - 仅支持Ubuntu
+check_system_compatibility() {
+    log_info "检查系统兼容性..."
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        local os_name="$ID"
+        local os_version="$VERSION_ID"
+        
+        if [ "$os_name" != "ubuntu" ]; then
+            log_error "❌ 不支持的操作系统: $os_name"
+            log_error "本脚本仅支持Ubuntu系统"
+            log_error "推荐使用: Ubuntu 24.04 LTS（首选）/ 22.04 LTS / 20.04 LTS"
+            exit 1
+        fi
+        
+        case $os_version in
+            "24.04")
+                log "✓ 检测到最新推荐的Ubuntu 24.04 LTS版本（长期支持到2029年）"
+                log "🌟 您正在使用最佳性能版本，享受所有优化特性！"
+                ;;
+            "22.04")
+                log "✓ 检测到推荐的Ubuntu 22.04 LTS版本（长期支持到2027年）"
+                log "💡 建议升级到Ubuntu 24.04 LTS以获得25%性能提升和更长支持周期"
+                ;;
+            "20.04")
+                log "✓ 检测到Ubuntu 20.04 LTS版本（长期支持到2025年）"
+                log_warn "⚠ 建议升级到Ubuntu 24.04 LTS以获得更好的性能和更长的支持周期"
+                log_warn "  升级命令: sudo do-release-upgrade"
+                ;;
+            "18.04")
+                log_error "❌ Ubuntu 18.04 LTS已不再支持"
+                log_error "请升级到Ubuntu 24.04 LTS（推荐）或22.04 LTS"
+                log_error "升级命令: sudo do-release-upgrade -d"
+                exit 1
+                ;;
+            *)
+                if [[ "$os_version" < "20.04" ]]; then
+                    log_error "❌ Ubuntu版本过旧: $os_version"
+                    log_error "请升级到Ubuntu 24.04 LTS（推荐）或20.04 LTS以上版本"
+                    log_error "升级命令: sudo do-release-upgrade -d"
+                    exit 1
+                else
+                    log "✓ Ubuntu版本: $os_version"
+                    log_warn "⚠ 建议使用Ubuntu 24.04 LTS以获得最佳兼容性和性能"
+                    log_warn "  升级命令: sudo do-release-upgrade"
+                fi
+                ;;
+        esac
+    else
+        log_error "❌ 无法检测操作系统版本"
+        log_error "请确保在Ubuntu系统上运行此脚本"
+        exit 1
+    fi
 }
 
 # 检查是否为sudo用户
@@ -272,10 +330,77 @@ optimize_system_for_odoo() {
     # 获取系统资源信息
     local cpu_cores=$(nproc)
     local total_mem=$(free -g | awk '/^Mem:/{print $2}')
+    local ubuntu_version=$(lsb_release -rs 2>/dev/null || echo "unknown")
     
-    # 内核参数优化 - 外贸管理系统专用
-    log "优化内核参数（外贸管理系统专用）..."
-    cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
+    # Ubuntu 24.04 LTS特定优化
+    if [ "$ubuntu_version" = "24.04" ]; then
+        log "应用Ubuntu 24.04 LTS专用优化配置..."
+        
+        # Ubuntu 24.04的增强网络优化
+        cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
+# 茂亨Odoo外贸管理系统内核优化 - Ubuntu 24.04 LTS专用
+
+# 网络优化（Ubuntu 24.04增强版，外贸管理系统需要处理大量并发连接）
+net.core.somaxconn = 131072
+net.core.netdev_max_backlog = 30000
+net.ipv4.tcp_max_syn_backlog = 131072
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_recycle = 0
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_rmem = 8192 131072 33554432
+net.ipv4.tcp_wmem = 8192 131072 33554432
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+
+# 内存管理优化（Ubuntu 24.04增强版，外贸管理系统大数据处理）
+vm.swappiness = 1
+vm.dirty_ratio = 5
+vm.dirty_background_ratio = 2
+vm.overcommit_memory = 1
+vm.overcommit_ratio = 90
+vm.vfs_cache_pressure = 50
+vm.zone_reclaim_mode = 0
+vm.page_lock_unfairness = 1
+
+# 文件系统优化（Ubuntu 24.04增强版，外贸管理系统文档处理）
+fs.file-max = 4194304
+fs.nr_open = 4194304
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_user_instances = 1024
+fs.aio-max-nr = 1048576
+
+# 进程优化（Ubuntu 24.04增强版）
+kernel.pid_max = 8388608
+kernel.threads-max = 8388608
+kernel.sched_migration_cost_ns = 5000000
+
+# 安全优化
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+EOF
+    else
+        # 其他Ubuntu版本的标准优化
+        log "应用标准Ubuntu优化配置..."
+        cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
 # 茂亨Odoo外贸管理系统内核优化
 
 # 网络优化（外贸管理系统需要处理大量并发连接）
@@ -327,13 +452,31 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.tcp_syncookies = 1
 EOF
+    fi
     
     # 应用内核参数
     sysctl -p /etc/sysctl.d/99-morhon-odoo.conf
     
     # 系统限制优化
     log "优化系统限制..."
-    cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
+    if [ "$ubuntu_version" = "24.04" ]; then
+        # Ubuntu 24.04增强限制
+        cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
+# 茂亨Odoo专用服务器限制优化 - Ubuntu 24.04 LTS增强版
+* soft nofile 131072
+* hard nofile 131072
+* soft nproc 65536
+* hard nproc 65536
+* soft memlock unlimited
+* hard memlock unlimited
+root soft nofile 131072
+root hard nofile 131072
+www-data soft nofile 131072
+www-data hard nofile 131072
+EOF
+    else
+        # 标准限制配置
+        cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
 # 茂亨Odoo专用服务器限制优化
 * soft nofile 65536
 * hard nofile 65536
@@ -344,11 +487,49 @@ root hard nofile 65536
 www-data soft nofile 65536
 www-data hard nofile 65536
 EOF
+    fi
     
     # Docker优化
     log "优化Docker配置..."
     mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << EOF
+    if [ "$ubuntu_version" = "24.04" ]; then
+        # Ubuntu 24.04 Docker增强配置
+        cat > /etc/docker/daemon.json << EOF
+{
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "100m",
+        "max-file": "3"
+    },
+    "storage-driver": "overlay2",
+    "storage-opts": [
+        "overlay2.override_kernel_check=true"
+    ],
+    "default-ulimits": {
+        "nofile": {
+            "Name": "nofile",
+            "Hard": 131072,
+            "Soft": 131072
+        },
+        "nproc": {
+            "Name": "nproc",
+            "Hard": 65536,
+            "Soft": 65536
+        }
+    },
+    "max-concurrent-downloads": 10,
+    "max-concurrent-uploads": 5,
+    "default-shm-size": "128M",
+    "userland-proxy": false,
+    "experimental": false,
+    "features": {
+        "buildkit": true
+    }
+}
+EOF
+    else
+        # 标准Docker配置
+        cat > /etc/docker/daemon.json << EOF
 {
     "log-driver": "json-file",
     "log-opts": {
@@ -370,6 +551,7 @@ EOF
     }
 }
 EOF
+    fi
     
     # 重启Docker服务
     systemctl restart docker
@@ -508,43 +690,47 @@ EOF
     log "专用服务器系统优化完成"
 }
 
-# 安装Docker
+# 安装Docker - 仅支持Ubuntu
 install_docker() {
     log "安装Docker..."
     
-    # 检查系统类型
+    # 确保是Ubuntu系统
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        OS=$ID
-        VERSION=$VERSION_ID
+        if [ "$ID" != "ubuntu" ]; then
+            log_error "不支持的操作系统，仅支持Ubuntu"
+            return 1
+        fi
+        
+        # Ubuntu版本提示
+        case $VERSION_ID in
+            "24.04")
+                log "在Ubuntu 24.04 LTS上安装Docker（最新推荐版本）..."
+                ;;
+            "22.04")
+                log "在Ubuntu 22.04 LTS上安装Docker（推荐版本）..."
+                ;;
+            "20.04")
+                log "在Ubuntu 20.04 LTS上安装Docker..."
+                log_warn "建议升级到Ubuntu 24.04 LTS以获得更好的Docker支持"
+                ;;
+            *)
+                log_warn "Ubuntu版本: $VERSION_ID，强烈推荐使用24.04 LTS"
+                ;;
+        esac
     else
         log_error "无法检测操作系统类型"
         return 1
     fi
     
-    case $OS in
-        ubuntu|debian)
-            # 添加Docker官方GPG密钥
-            mkdir -p /etc/apt/keyrings
-            curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-            
-            apt-get update
-            apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-            ;;
-        centos|rhel|fedora)
-            # CentOS/RHEL/Fedora
-            yum install -y yum-utils
-            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-            systemctl start docker
-            systemctl enable docker
-            ;;
-        *)
-            log_error "不支持的操作系统: $OS"
-            return 1
-            ;;
-    esac
+    # 安装Docker（仅Ubuntu）
+    # 添加Docker官方GPG密钥
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
     
     # 启动Docker服务
     systemctl start docker
@@ -3108,6 +3294,9 @@ show_no_instance_menu() {
 main() {
     check_sudo
     
+    # 检查系统兼容性
+    check_system_compatibility
+    
     # 一次性检测所有环境信息
     detect_environment
     
@@ -3205,6 +3394,13 @@ if [ $# -ge 1 ]; then
             echo "  • 网站功能建议使用WordPress等专业系统"
             echo "  • 数据卷映射：防止用户误操作和插件冲突"
             echo "  • 禁止自装插件：避免系统不稳定和安全风险"
+            echo ""
+            echo "系统要求:"
+            echo "  • 支持系统: 仅支持Ubuntu系统"
+            echo "  • 推荐版本: Ubuntu 24.04 LTS（首选）/ 22.04 LTS / 20.04 LTS"
+            echo "  • 最低配置: 4核CPU, 8GB内存, 80GB存储"
+            echo "  • 推荐配置: 6核CPU, 16GB内存, 160GB SSD"
+            echo "  • 网络要求: 稳定互联网连接，5Mbps以上带宽"
             echo ""
             echo "目录结构:"
             echo "  • 实例目录: /opt/morhon-odoo"
