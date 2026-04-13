@@ -1,1 +1,7 @@
-.vscode/
+# Ignore everything
+*
+
+# Only track these files
+!.gitignore
+!morhon-odoo.sh
+!README.md

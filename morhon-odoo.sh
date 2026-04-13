@@ -305,9 +305,9 @@ init_environment() {
         install_docker
     fi
     
-    # 安装Docker Compose
-    if ! command -v docker-compose &> /dev/null; then
-        install_docker_compose
+    # 安装Docker Compose (included with docker-compose-plugin)
+    if ! docker compose version &> /dev/null; then
+        log_warn "docker compose 插件未安装，请确认 docker-compose-plugin 已安装"
     fi
     
     # 专用服务器系统优化
@@ -349,7 +349,6 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_rmem = 8192 131072 33554432
 net.ipv4.tcp_wmem = 8192 131072 33554432
@@ -366,7 +365,6 @@ vm.overcommit_memory = 1
 vm.overcommit_ratio = 90
 vm.vfs_cache_pressure = 50
 vm.zone_reclaim_mode = 0
-vm.page_lock_unfairness = 1
 
 # 文件系统优化（Ubuntu 24.04增强版，外贸管理系统文档处理）
 fs.file-max = 4194304
@@ -412,7 +410,6 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_rmem = 4096 65536 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
@@ -618,9 +615,6 @@ EOF
 
 # 每周清理Nginx日志（保留30天）
 0 1 * * 1 root find /var/log/nginx/ -name "*.log" -mtime +30 -delete
-
-# 每月第一天清理Redis过期键
-0 5 1 * * root docker exec morhon-odoo-redis redis-cli --scan --pattern "*" | head -1000 | xargs docker exec morhon-odoo-redis redis-cli del >/dev/null 2>&1 || true
 EOF
     
     # 禁用不必要的服务（外贸管理系统安全加固）
@@ -672,7 +666,14 @@ EOF
         cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
         
         # SSH安全配置
-        sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+        # Only disable root login if there are other sudo-capable users
+        local sudo_users=$(grep -E '^sudo:' /etc/group | cut -d: -f4 | tr ',' '\n' | grep -v '^$' | wc -l)
+        if [ "$sudo_users" -gt 0 ]; then
+            sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+            log "已禁用root SSH登录（检测到 $sudo_users 个sudo用户）"
+        else
+            log_warn "未检测到其他sudo用户，保留root SSH登录以防锁定"
+        fi
         sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
         sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
         sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
@@ -745,12 +746,9 @@ install_docker() {
     log "Docker安装完成"
 }
 
-# 安装Docker Compose
+# 安装Docker Compose（已包含在 docker-compose-plugin 中）
 install_docker_compose() {
-    log "安装Docker Compose..."
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    log "Docker Compose安装完成"
+    log "Docker Compose 已通过 docker-compose-plugin 安装"
 }
 
 # 配置防火墙 - 生产环境安全加固
@@ -987,15 +985,14 @@ EOF
     log "Nginx专用服务器配置完成"
 }
 
-# 创建Docker卷 - 包含Redis
+# 创建Docker卷
 create_docker_volumes() {
-    log "创建Docker卷（包含Redis缓存）..."
+    log "创建Docker卷..."
     
     create_volume "$DB_VOLUME_NAME" "数据库卷"
     create_volume "$ODOO_VOLUME_NAME" "Odoo文件卷"
-    create_volume "morhon-redis" "Redis缓存卷"
     
-    log "Docker卷创建完成（包含Redis缓存支持）"
+    log "Docker卷创建完成"
 }
 
 # 创建Docker卷（辅助函数）
@@ -1099,111 +1096,88 @@ create_odoo_config() {
     local workers="$1"
     local total_mem="$2"
     
-    # 外贸管理系统内存分配策略（针对大量产品和订单数据）
-    local memory_hard=$((total_mem * 450))  # 外贸管理系统需要更多内存处理复杂数据
-    local memory_soft=$((total_mem * 350))  # 软限制也相应提高
+    # Read passwords from .env file if it exists, otherwise use defaults
+    local db_password="odoo"
+    local admin_password="admin"
+    if [ -f "$INSTANCE_DIR/.env" ]; then
+        db_password=$(grep "^DB_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2)
+        admin_password=$(grep "^ADMIN_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2)
+    fi
     
-    # 确保最小值（外贸管理系统基础要求）
-    [ "$memory_hard" -lt 1536 ] && memory_hard=1536  # 外贸管理系统最少1.5GB
-    [ "$memory_soft" -lt 1024 ] && memory_soft=1024  # 软限制最少1GB
+    # 内存限制（Odoo 17 使用字节）
+    local memory_hard_bytes=$((total_mem * 450 * 1024 * 1024))  # ~450MB per GB RAM
+    local memory_soft_bytes=$((total_mem * 350 * 1024 * 1024))  # ~350MB per GB RAM
     
-    # 数据库连接池优化（外贸管理系统多表关联查询较多）
-    local db_maxconn=$((workers * 4 + 12))  # 外贸管理系统需要更多数据库连接
-    local max_cron_threads=$((workers > 8 ? 6 : workers > 4 ? 4 : 3))  # 更多定时任务处理
+    # 确保最小值
+    [ "$memory_hard_bytes" -lt $((1536 * 1024 * 1024)) ] && memory_hard_bytes=$((1536 * 1024 * 1024))
+    [ "$memory_soft_bytes" -lt $((1024 * 1024 * 1024)) ] && memory_soft_bytes=$((1024 * 1024 * 1024))
+    
+    # 数据库连接池
+    local db_maxconn=$((workers * 2 + 4))
+    local db_maxconn_gevent=$((workers * 2))
+    local max_cron_threads=$((workers > 8 ? 4 : workers > 4 ? 3 : 2))
     
     cat > "$INSTANCE_DIR/config/odoo.conf" << EOF
 [options]
 # 基本配置
-admin_passwd = \${ADMIN_PASSWORD}
+admin_passwd = $admin_password
 addons_path = /mnt/extra-addons,/mnt/odoo/addons
 data_dir = /var/lib/odoo
 without_demo = all
 proxy_mode = True
+list_db = False
 
-# 外贸管理系统性能配置
+# 网络配置（容器内监听所有接口，由 docker ports 限制为 127.0.0.1）
+http_port = 8069
+gevent_port = 8072
+
+# Worker 配置
 workers = $workers
-limit_memory_hard = ${memory_hard}M
-limit_memory_soft = ${memory_soft}M
 max_cron_threads = $max_cron_threads
-limit_time_cpu = 1800
-limit_time_real = 3600
-limit_request = 32768
 
-# 数据库优化配置（外贸管理系统）
+# 内存限制（字节）
+limit_memory_hard = $memory_hard_bytes
+limit_memory_soft = $memory_soft_bytes
+
+# 时间限制（秒）
+limit_time_cpu = 600
+limit_time_real = 1200
+limit_time_real_cron = 3600
+limit_request = 65536
+
+# 数据库配置
 db_host = db
 db_port = 5432
 db_user = odoo
-db_password = \${DB_PASSWORD}
+db_password = $db_password
 db_name = postgres
 db_maxconn = $db_maxconn
-list_db = False
+db_maxconn_gevent = $db_maxconn_gevent
 db_sslmode = prefer
 db_template = template0
 
-# Redis缓存配置 - 外贸管理系统优化
-enable_redis = True
-redis_host = redis
-redis_port = 6379
-redis_db = 0
-redis_pass = False
-redis_expiration = 43200
-
-# 会话管理优化（外贸管理系统用户长时间在线）
-session_redis = True
-session_redis_host = redis
-session_redis_port = 6379
-session_redis_db = 1
-session_redis_prefix = odoo_session
-session_timeout = 28800
-
-# 缓存优化（外贸管理系统大数据量）
+# 临时记录清理（小时，替代旧版 osv_memory_age_limit）
+transient_age_limit = 2.0
 osv_memory_count_limit = 0
-osv_memory_age_limit = 2.0
 
 # 日志配置
-log_level = info
-log_handler = :INFO
+log_level = warn
+log_handler = :WARNING,odoo.addons.mail_advance:INFO
 logfile = /var/log/odoo/odoo.log
 log_db = False
-log_db_level = warning
 syslog = False
 
 # 安全配置
 server_wide_modules = base,web
 unaccent = True
-list_db = False
 
-# 邮件配置
-email_from = noreply@localhost
-smtp_server = localhost
-smtp_port = 25
-smtp_ssl = False
-smtp_user = False
-smtp_password = False
-
-# 外贸管理系统专用优化
-translate_modules = ['all']
+# 语言
 load_language = zh_CN,en_US
-currency_precision = 4
-price_precision = 4
 
-# 报表和导出优化（外贸管理系统单据较多）
+# 报表压缩
 reportgz = True
-csv_internal_sep = ,
-import_partial = 500
-export_partial = 1000
 
-# 外贸管理系统专用缓存策略
-cache_timeout = 1800
-static_cache_timeout = 604800
-
-# 文件上传优化（外贸管理系统文档较大）
-max_file_upload_size = 536870912
-
-# 外贸管理系统业务定时任务优化
-cron_workers = $((max_cron_threads))
-
-# 数据库查询优化
+# 数据库工具路径
 pg_path = /usr/bin
 EOF
 }
@@ -1215,62 +1189,13 @@ create_docker_compose_config() {
     local total_mem=$(free -g | awk '/^Mem:/{print $2}')
     
     # 外贸管理系统资源分配策略
-    local redis_memory=1024  # Redis使用1GB内存（外贸管理系统缓存需求大）
-    # 如果内存大于8GB，Redis可以使用更多内存
-    if [ "$total_mem" -gt 8 ]; then
-        redis_memory=$((total_mem * 128))  # 大内存服务器Redis使用12.5%内存
-        [ "$redis_memory" -gt 4096 ] && redis_memory=4096  # 最大4GB
-    fi
     local db_memory="${total_mem}g"
     local db_shared_buffers=$((total_mem * 256))  # 25% 内存作为shared_buffers
     local db_effective_cache_size=$((total_mem * 768))  # 75% 内存作为effective_cache_size
     
     cat > "$INSTANCE_DIR/docker-compose.yml" << EOF
-version: '3.8'
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: morhon-odoo-redis
-    restart: unless-stopped
-    command: >
-      redis-server
-      --maxmemory ${redis_memory}mb
-      --maxmemory-policy allkeys-lru
-      --save 900 1
-      --save 300 10
-      --save 60 10000
-      --appendonly yes
-      --appendfsync everysec
-      --tcp-keepalive 300
-      --timeout 0
-      --tcp-backlog 511
-      --databases 16
-      --maxclients 10000
-    volumes:
-      - redis-data:/data
-    networks:
-      - morhon-network
-    deploy:
-      resources:
-        limits:
-          memory: ${redis_memory}mb
-          cpus: '1.0'
-        reservations:
-          memory: $((redis_memory / 2))mb
-          cpus: '0.5'
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   db:
     image: $POSTGRES_IMAGE
     container_name: morhon-odoo-db
@@ -1336,19 +1261,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       HOST: db
       PORT: 5432
       USER: odoo
       PASSWORD: \${DB_PASSWORD}
       DB_NAME: postgres
-      ADMIN_PASSWORD: \${ADMIN_PASSWORD}
-      # Redis缓存配置
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
       # 外贸管理系统环境变量
       TZ: Asia/Shanghai
       LANG: zh_CN.UTF-8
@@ -1403,9 +1321,6 @@ volumes:
     external: true
   $ODOO_VOLUME_NAME:
     external: true
-  redis-data:
-    driver: local
-    name: morhon-redis
 EOF
 }
 
@@ -1462,6 +1377,15 @@ create_nginx_domain_config() {
     
     tee "$config_file" > /dev/null << EOF
 # 茂亨Odoo公网生产环境配置 - $domain
+
+# Upstream 定义
+upstream odoo_backend {
+    server 127.0.0.1:8069;
+}
+
+upstream odoo_longpolling {
+    server 127.0.0.1:8072;
+}
 
 # HTTP重定向到HTTPS（公网安全要求）
 server {
@@ -1529,69 +1453,70 @@ server {
         return 403;
     }
     
-    location ~* /web/static/.*\.(py|pyc|pyo|xml)$ {
+    location ~* /web/static/.*\.(py|pyc|pyo|xml)\$ {
         deny all;
         return 403;
     }
     
     # 阻止常见攻击路径
-    location ~* \.(git|svn|env|htaccess|htpasswd)$ {
+    location ~* \\.(git|svn|env|htaccess|htpasswd)\$ {
         deny all;
         return 403;
     }
     
-    # 长轮询请求优化
-    location /longpolling {
-        proxy_pass http://127.0.0.1:8072;
+    # WebSocket / 长轮询
+    location /websocket {
+        proxy_pass http://odoo_longpolling;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_connect_timeout 60s;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
     
-    # 静态文件缓存优化 - 公网环境
+    # 兼容旧版 longpolling 路径
+    location /longpolling {
+        proxy_pass http://odoo_longpolling;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+    
+    # 静态文件缓存
     location ~* /web/static/ {
-        proxy_pass http://127.0.0.1:8069;
+        proxy_pass http://odoo_backend;
         proxy_cache odoo_cache;
-        proxy_cache_valid 200 302 1d;
+        proxy_cache_valid 200 302 7d;
         proxy_cache_valid 404 1m;
         proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
         proxy_cache_lock on;
-        expires 7d;
+        expires 30d;
         add_header Cache-Control "public, immutable";
         add_header X-Cache-Status \$upstream_cache_status;
     }
     
-    # 文件上传优化 - 外贸文档支持
-    location ~* /web/binary/ {
-        proxy_pass http://127.0.0.1:8069;
+    # 文件上传/下载
+    location ~* /web/(binary|content)/ {
+        proxy_pass http://odoo_backend;
         client_max_body_size 500M;
-        client_body_buffer_size 128k;
         proxy_request_buffering off;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
     
-    # 报表和导出优化
-    location ~* /(web/content|report)/ {
-        proxy_pass http://127.0.0.1:8069;
+    # 报表生成（耗时较长）
+    location ~* /report/ {
+        proxy_pass http://odoo_backend;
         proxy_read_timeout 600s;
         proxy_send_timeout 600s;
         proxy_buffering off;
     }
     
-    # API接口优化
-    location ~* /jsonrpc {
-        proxy_pass http://127.0.0.1:8069;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-    
     # 主请求处理
     location / {
-        proxy_pass http://127.0.0.1:8069;
+        proxy_pass http://odoo_backend;
         proxy_redirect off;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
@@ -1619,6 +1544,15 @@ create_nginx_local_config() {
     
     tee "$config_file" > /dev/null << EOF
 # 茂亨Odoo内网生产环境配置 - 通过IP访问
+
+# Upstream 定义
+upstream odoo_backend {
+    server 127.0.0.1:8069;
+}
+
+upstream odoo_longpolling {
+    server 127.0.0.1:8072;
+}
 
 server {
     listen 80 default_server;
@@ -1648,75 +1582,69 @@ server {
     proxy_buffers 32 64k;
     proxy_busy_buffers_size 128k;
     
-    # 禁止访问敏感路径（生产环境安全）
+    # 禁止访问敏感路径
     location ~* /(web|api)/database/ {
         deny all;
         return 403;
     }
     
-    location ~* /web/static/.*\.(py|pyc|pyo|xml)$ {
+    location ~* /web/static/.*\\.(py|pyc|pyo|xml)\$ {
         deny all;
         return 403;
     }
     
-    # 内网IP访问控制（可选配置）
-    # allow 192.168.0.0/16;
-    # allow 10.0.0.0/8;
-    # allow 172.16.0.0/12;
-    # deny all;
-    
-    # 长轮询请求优化
-    location /longpolling {
-        proxy_pass http://127.0.0.1:8072;
+    # WebSocket / 长轮询
+    location /websocket {
+        proxy_pass http://odoo_longpolling;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_connect_timeout 60s;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
     
-    # 静态文件缓存优化
+    location /longpolling {
+        proxy_pass http://odoo_longpolling;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+    
+    # 静态文件缓存
     location ~* /web/static/ {
-        proxy_pass http://127.0.0.1:8069;
+        proxy_pass http://odoo_backend;
         proxy_cache odoo_cache;
-        proxy_cache_valid 200 302 1d;
+        proxy_cache_valid 200 302 7d;
         proxy_cache_valid 404 1m;
         proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
         proxy_cache_lock on;
-        expires 7d;
+        expires 30d;
         add_header Cache-Control "public, immutable";
         add_header X-Cache-Status \$upstream_cache_status;
     }
     
-    # 文件上传优化 - 外贸文档支持
-    location ~* /web/binary/ {
-        proxy_pass http://127.0.0.1:8069;
+    # 文件上传/下载
+    location ~* /web/(binary|content)/ {
+        proxy_pass http://odoo_backend;
         client_max_body_size 500M;
-        client_body_buffer_size 128k;
         proxy_request_buffering off;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
     
-    # 报表和导出优化
-    location ~* /(web/content|report)/ {
-        proxy_pass http://127.0.0.1:8069;
+    # 报表生成
+    location ~* /report/ {
+        proxy_pass http://odoo_backend;
         proxy_read_timeout 600s;
         proxy_send_timeout 600s;
         proxy_buffering off;
     }
     
-    # API接口优化
-    location ~* /jsonrpc {
-        proxy_pass http://127.0.0.1:8069;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-    
     # 主请求处理
     location / {
-        proxy_pass http://127.0.0.1:8069;
+        proxy_pass http://odoo_backend;
         proxy_redirect off;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
@@ -1727,7 +1655,7 @@ server {
     error_log /var/log/nginx/morhon-odoo-error.log;
 }
 EOF
-    
+
     # 启用站点
     ln -sf "$config_file" "/etc/nginx/sites-enabled/"
     rm -f /etc/nginx/sites-enabled/default
@@ -1943,8 +1871,8 @@ optimize_migrated_instance() {
     
     # 重启容器以应用新配置
     cd "$INSTANCE_DIR"
-    docker-compose down
-    docker-compose up -d
+    docker compose down
+    docker compose up -d
     
     # 等待服务启动
     log "等待优化后的服务启动..."
@@ -1963,7 +1891,7 @@ optimize_database_after_migration() {
     # 等待数据库完全启动
     local db_ready=false
     for i in {1..30}; do
-        if docker-compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
+        if docker compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
             db_ready=true
             break
         fi
@@ -1973,8 +1901,8 @@ optimize_database_after_migration() {
     if [ "$db_ready" = true ]; then
         # 执行数据库维护
         log "执行数据库维护操作..."
-        docker-compose exec -T db psql -U odoo -d postgres -c "VACUUM ANALYZE;" >/dev/null 2>&1 || true
-        docker-compose exec -T db psql -U odoo -d postgres -c "REINDEX DATABASE postgres;" >/dev/null 2>&1 || true
+        docker compose exec -T db psql -U odoo -d postgres -c "VACUUM ANALYZE;" >/dev/null 2>&1 || true
+        docker compose exec -T db psql -U odoo -d postgres -c "REINDEX DATABASE postgres;" >/dev/null 2>&1 || true
         log "数据库优化完成"
     else
         log_warn "数据库未能及时启动，跳过数据库优化"
@@ -2082,13 +2010,13 @@ start_services() {
     cd "$INSTANCE_DIR"
     
     # 启动服务
-    docker-compose up -d
+    docker compose up -d
     
     # 等待数据库就绪
     log "等待数据库启动..."
     local db_ready=false
     for i in {1..30}; do
-        if docker-compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
+        if docker compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
             db_ready=true
             break
         fi
@@ -2241,22 +2169,6 @@ restore_from_backup() {
     
     # 恢复数据库
     restore_from_backup_file "$backup_data"
-    
-    # 恢复Redis缓存（如果存在）
-    local redis_backup=$(find "$temp_dir" -name "redis-dump.rdb" -type f | head -1)
-    if [ -n "$redis_backup" ] && [ -f "$redis_backup" ]; then
-        log "恢复Redis缓存..."
-        # 等待Redis容器启动
-        sleep 5
-        if docker cp "$redis_backup" morhon-odoo-redis:/data/dump.rdb 2>/dev/null; then
-            docker-compose restart redis >/dev/null 2>&1 || true
-            log "Redis缓存恢复完成"
-        else
-            log_warn "Redis缓存恢复失败，系统将自动重建缓存"
-        fi
-    else
-        log "未找到Redis备份文件，系统将自动重建缓存"
-    fi
     
     # 恢复其他配置（如果存在）
     restore_additional_configs "$temp_dir"
@@ -2584,64 +2496,25 @@ check_system_status() {
     echo -e "\n${YELLOW}容器状态:${NC}"
     if [ -f "$INSTANCE_DIR/docker-compose.yml" ]; then
         cd "$INSTANCE_DIR"
-        docker-compose ps
+        docker compose ps
         
         # 检查容器资源使用
         echo -e "\n${YELLOW}容器资源使用:${NC}"
-        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" morhon-odoo morhon-odoo-db morhon-odoo-redis 2>/dev/null || echo "无法获取容器统计信息"
-        
-        # Redis缓存状态检查
-        echo -e "\n${YELLOW}Redis缓存状态:${NC}"
-        if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
-            echo "✓ Redis服务运行正常"
-            
-            # Redis内存使用
-            local redis_memory=$(docker exec morhon-odoo-redis redis-cli info memory 2>/dev/null | grep "used_memory_human:" | cut -d':' -f2 | tr -d '\r')
-            local redis_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
-            local redis_hits=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
-            local redis_misses=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
-            
-            echo "  内存使用: $redis_memory"
-            echo "  缓存键数: $redis_keys"
-            
-            if [ -n "$redis_hits" ] && [ -n "$redis_misses" ] && [ "$redis_hits" -gt 0 ] && [ "$redis_misses" -gt 0 ]; then
-                local hit_rate=$(( redis_hits * 100 / (redis_hits + redis_misses) ))
-                echo "  命中率: ${hit_rate}%"
-                
-                if [ "$hit_rate" -lt 70 ]; then
-                    echo "  ⚠ 缓存命中率较低，建议检查缓存策略"
-                elif [ "$hit_rate" -gt 90 ]; then
-                    echo "  ✓ 缓存命中率优秀"
-                else
-                    echo "  ✓ 缓存命中率良好"
-                fi
-            fi
-        else
-            echo "✗ Redis服务未运行"
-        fi
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" morhon-odoo morhon-odoo-db 2>/dev/null || echo "无法获取容器统计信息"
     else
         echo "未找到Docker Compose配置文件"
     fi
     
     # 检查端口状态
     echo -e "\n${YELLOW}端口状态:${NC}"
-    local ports=("80:HTTP" "443:HTTPS" "8069:Odoo" "8072:Longpolling" "6379:Redis")
+    local ports=("80:HTTP" "443:HTTPS" "8069:Odoo" "8072:Longpolling")
     for port_info in "${ports[@]}"; do
         local port=$(echo "$port_info" | cut -d':' -f1)
         local service=$(echo "$port_info" | cut -d':' -f2)
-        if [ "$port" = "6379" ]; then
-            # Redis端口只在容器内部，检查容器是否运行
-            if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
-                echo "✓ 端口$port ($service) 容器内运行正常"
-            else
-                echo "✗ 端口$port ($service) 容器未运行"
-            fi
+        if netstat -tlnp | grep -q ":$port "; then
+            echo "✓ 端口$port ($service) 已监听"
         else
-            if netstat -tlnp | grep -q ":$port "; then
-                echo "✓ 端口$port ($service) 已监听"
-            else
-                echo "✗ 端口$port ($service) 未监听"
-            fi
+            echo "✗ 端口$port ($service) 未监听"
         fi
     done
     
@@ -2773,24 +2646,6 @@ check_system_status() {
         echo "⚠ 磁盘空间不足，建议清理日志和备份文件"
     fi
     
-    # Redis缓存建议
-    if docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
-        local redis_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
-        local redis_hits=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
-        local redis_misses=$(docker exec morhon-odoo-redis redis-cli info stats 2>/dev/null | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
-        
-        if [ -n "$redis_hits" ] && [ -n "$redis_misses" ] && [ "$redis_hits" -gt 0 ] && [ "$redis_misses" -gt 0 ]; then
-            local hit_rate=$(( redis_hits * 100 / (redis_hits + redis_misses) ))
-            if [ "$hit_rate" -lt 70 ]; then
-                echo "⚠ Redis缓存命中率较低($hit_rate%)，建议优化缓存策略"
-            fi
-        fi
-        
-        if [ "$redis_keys" -gt 100000 ]; then
-            echo "⚠ Redis缓存键数量较多($redis_keys)，建议定期清理过期缓存"
-        fi
-    fi
-    
     # 外贸业务专用建议
     local current_hour=$(date +%H)
     if [ "$current_hour" -ge 9 ] && [ "$current_hour" -le 18 ]; then
@@ -2813,17 +2668,17 @@ show_instance_status() {
     echo ""
     echo -e "${CYAN}实例状态:${NC}"
     cd "$INSTANCE_DIR"
-    docker-compose ps
+    docker compose ps
     echo ""
     echo -e "${CYAN}卷状态:${NC}"
-    docker volume ls | grep -E "($DB_VOLUME_NAME|$ODOO_VOLUME_NAME|morhon-redis)"
+    docker volume ls | grep -E "($DB_VOLUME_NAME|$ODOO_VOLUME_NAME)"
 }
 
 # 重启实例
 restart_instance() {
     echo ""
     cd "$INSTANCE_DIR"
-    docker-compose restart
+    docker compose restart
     systemctl reload nginx
     log "实例已重启"
 }
@@ -2837,8 +2692,8 @@ show_logs() {
     read -p "选择日志类型 (1-3): " log_type
     
     case $log_type in
-        1) cd "$INSTANCE_DIR" && docker-compose logs -f odoo ;;
-        2) cd "$INSTANCE_DIR" && docker-compose logs -f db ;;
+        1) cd "$INSTANCE_DIR" && docker compose logs -f odoo ;;
+        2) cd "$INSTANCE_DIR" && docker compose logs -f db ;;
         3) tail -f /var/log/nginx/error.log ;;
         *) log_error "无效选择" ;;
     esac
@@ -2857,20 +2712,11 @@ backup_instance() {
     # 备份数据库
     log "备份数据库..."
     cd "$INSTANCE_DIR"
-    if docker-compose exec -T db pg_dump -U odoo postgres | gzip > "$backup_path/database.sql.gz"; then
+    if docker compose exec -T db pg_dump -U odoo postgres | gzip > "$backup_path/database.sql.gz"; then
         log "数据库备份完成"
     else
         log_error "数据库备份失败"
         return 1
-    fi
-    
-    # 备份Redis缓存数据
-    log "备份Redis缓存..."
-    if docker-compose exec -T redis redis-cli --rdb /data/dump.rdb >/dev/null 2>&1; then
-        docker cp morhon-odoo-redis:/data/dump.rdb "$backup_path/redis-dump.rdb" 2>/dev/null || log_warn "Redis备份复制失败"
-        log "Redis缓存备份完成"
-    else
-        log_warn "Redis缓存备份失败，继续其他备份"
     fi
     
     # 备份配置文件
@@ -2891,24 +2737,14 @@ backup_instance() {
 备份时间: $(date '+%Y-%m-%d %H:%M:%S')
 脚本版本: 6.2
 实例目录: $INSTANCE_DIR
-备份类型: 完整备份（包含Redis缓存）
+备份类型: 完整备份
 
 包含内容:
 - 数据库完整备份 (database.sql.gz)
-- Redis缓存备份 (redis-dump.rdb)
 - Odoo配置文件 (config/)
 - Docker Compose配置 (docker-compose.yml)
 - 环境变量 (.env)
 - Nginx配置 (nginx-config)
-
-恢复方法:
-1. 解压备份文件
-2. 运行脚本选择"从本地备份恢复"
-3. 选择此备份文件
-
-注意事项:
-- Redis缓存会在系统启动后自动重建
-- 如果Redis备份文件不存在，不影响系统正常运行
 EOF
     
     # 打包备份
@@ -2934,14 +2770,12 @@ modify_config() {
     echo "1) 修改管理员密码"
     echo "2) 修改数据库密码"
     echo "3) 修改Nginx配置"
-    echo "4) Redis缓存管理"
-    read -p "选择操作 (1-4): " config_choice
+    read -p "选择操作 (1-3): " config_choice
     
     case $config_choice in
         1) update_admin_password ;;
         2) update_db_password ;;
         3) update_nginx_config ;;
-        4) manage_redis_cache ;;
         *) log_error "无效选择" ;;
     esac
 }
@@ -2950,7 +2784,7 @@ modify_config() {
 update_admin_password() {
     read -p "输入新管理员密码: " new_pass
     sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
-    cd "$INSTANCE_DIR" && docker-compose restart odoo
+    cd "$INSTANCE_DIR" && docker compose restart odoo
     log "管理员密码已更新"
 }
 
@@ -2958,7 +2792,7 @@ update_admin_password() {
 update_db_password() {
     read -p "输入新数据库密码: " new_pass
     sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
-    cd "$INSTANCE_DIR" && docker-compose restart
+    cd "$INSTANCE_DIR" && docker compose restart
     log "数据库密码已更新"
 }
 
@@ -2967,126 +2801,6 @@ update_nginx_config() {
     nano /etc/nginx/sites-available/morhon-odoo
     nginx -t && systemctl reload nginx
     log "Nginx配置已更新"
-}
-
-# Redis缓存管理
-manage_redis_cache() {
-    echo ""
-    echo -e "${CYAN}Redis缓存管理${NC}"
-    echo "=================="
-    
-    if ! docker exec morhon-odoo-redis redis-cli ping >/dev/null 2>&1; then
-        echo "Redis服务未运行"
-        return 1
-    fi
-    
-    echo "1) 查看缓存统计"
-    echo "2) 清空所有缓存"
-    echo "3) 清空会话缓存"
-    echo "4) 查看缓存配置"
-    echo "5) 返回"
-    read -p "选择操作 (1-5): " redis_choice
-    
-    case $redis_choice in
-        1) show_redis_stats ;;
-        2) clear_all_cache ;;
-        3) clear_session_cache ;;
-        4) show_redis_config ;;
-        5) return ;;
-        *) log_error "无效选择" ;;
-    esac
-}
-
-# 显示Redis统计信息
-show_redis_stats() {
-    echo ""
-    echo -e "${YELLOW}Redis缓存统计:${NC}"
-    
-    local redis_info=$(docker exec morhon-odoo-redis redis-cli info 2>/dev/null)
-    
-    # 内存使用
-    local used_memory=$(echo "$redis_info" | grep "used_memory_human:" | cut -d':' -f2 | tr -d '\r')
-    local used_memory_peak=$(echo "$redis_info" | grep "used_memory_peak_human:" | cut -d':' -f2 | tr -d '\r')
-    echo "内存使用: $used_memory (峰值: $used_memory_peak)"
-    
-    # 键统计
-    local total_keys=$(docker exec morhon-odoo-redis redis-cli dbsize 2>/dev/null | tr -d '\r')
-    echo "总键数: $total_keys"
-    
-    # 命中率统计
-    local hits=$(echo "$redis_info" | grep "keyspace_hits:" | cut -d':' -f2 | tr -d '\r')
-    local misses=$(echo "$redis_info" | grep "keyspace_misses:" | cut -d':' -f2 | tr -d '\r')
-    
-    if [ -n "$hits" ] && [ -n "$misses" ] && [ "$hits" -gt 0 ] && [ "$misses" -gt 0 ]; then
-        local hit_rate=$(( hits * 100 / (hits + misses) ))
-        echo "缓存命中: $hits 次"
-        echo "缓存未命中: $misses 次"
-        echo "命中率: ${hit_rate}%"
-    fi
-    
-    # 连接数
-    local connected_clients=$(echo "$redis_info" | grep "connected_clients:" | cut -d':' -f2 | tr -d '\r')
-    echo "连接客户端: $connected_clients"
-    
-    # 各数据库键数
-    echo ""
-    echo "各数据库键数:"
-    for db in {0..15}; do
-        local db_keys=$(docker exec morhon-odoo-redis redis-cli -n $db dbsize 2>/dev/null | tr -d '\r')
-        if [ "$db_keys" -gt 0 ]; then
-            case $db in
-                0) echo "  DB$db (应用缓存): $db_keys 键" ;;
-                1) echo "  DB$db (会话数据): $db_keys 键" ;;
-                *) echo "  DB$db: $db_keys 键" ;;
-            esac
-        fi
-    done
-}
-
-# 清空所有缓存
-clear_all_cache() {
-    echo ""
-    echo "⚠️  警告: 此操作将清空所有Redis缓存数据"
-    read -p "确认清空所有缓存？(y/N): " confirm
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker exec morhon-odoo-redis redis-cli flushall >/dev/null 2>&1
-        log "所有缓存已清空"
-        echo "系统将自动重建缓存，可能会暂时影响性能"
-    else
-        log "取消操作"
-    fi
-}
-
-# 清空会话缓存
-clear_session_cache() {
-    echo ""
-    echo "清空会话缓存将导致所有用户需要重新登录"
-    read -p "确认清空会话缓存？(y/N): " confirm
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        docker exec morhon-odoo-redis redis-cli -n 1 flushdb >/dev/null 2>&1
-        log "会话缓存已清空"
-        echo "所有用户需要重新登录"
-    else
-        log "取消操作"
-    fi
-}
-
-# 显示Redis配置
-show_redis_config() {
-    echo ""
-    echo -e "${YELLOW}Redis配置信息:${NC}"
-    
-    local redis_config=$(docker exec morhon-odoo-redis redis-cli config get "*" 2>/dev/null)
-    
-    echo "最大内存: $(docker exec morhon-odoo-redis redis-cli config get maxmemory 2>/dev/null | tail -1 | tr -d '\r') bytes"
-    echo "内存策略: $(docker exec morhon-odoo-redis redis-cli config get maxmemory-policy 2>/dev/null | tail -1 | tr -d '\r')"
-    echo "持久化: $(docker exec morhon-odoo-redis redis-cli config get save 2>/dev/null | tail -1 | tr -d '\r')"
-    echo "AOF: $(docker exec morhon-odoo-redis redis-cli config get appendonly 2>/dev/null | tail -1 | tr -d '\r')"
-    
-    local redis_version=$(docker exec morhon-odoo-redis redis-cli info server 2>/dev/null | grep "redis_version:" | cut -d':' -f2 | tr -d '\r')
-    echo "Redis版本: $redis_version"
 }
 
 # 优化现有实例
@@ -3164,14 +2878,14 @@ optimize_existing_instance() {
     cd "$INSTANCE_DIR"
     
     # 停止服务
-    docker-compose down
+    docker compose down
     
     # 重启Docker服务以应用新配置
     systemctl restart docker
     sleep 5
     
     # 启动优化后的服务
-    docker-compose up -d
+    docker compose up -d
     
     # 重启Nginx
     systemctl restart nginx
@@ -3383,7 +3097,6 @@ if [ $# -ge 1 ]; then
             echo "  • 完整的备份和恢复功能"
             echo "  • 手动实例迁移到脚本管理"
             echo "  • 外贸业务性能优化和安全加固"
-            echo "  • Redis缓存加速和会话管理"
             echo "  • 健康检查和状态监控"
             echo "  • Docker卷映射，防止插件冲突"
             echo ""
