@@ -29,7 +29,7 @@ DB_VOLUME_NAME="morhon-pg"
 ODOO_VOLUME_NAME="morhon-odoo"
 
 # 固定镜像配置
-ODOO_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/mh_odoosaas_v17:latest"
+ODOO_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:17"
 POSTGRES_IMAGE="registry.cn-hangzhou.aliyuncs.com/morhon_hub/postgres:latest"
 
 # 颜色输出
