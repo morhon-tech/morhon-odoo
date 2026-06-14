@@ -2,7 +2,7 @@
 
 # 茂亨Odoo外贸专用版管理脚本 - Ubuntu专用版
 # 单实例版本，支持本地模式和域名模式
-# 版本: 6.2
+# 版本: 6.3
 # 系统要求: 推荐Ubuntu 24.04 LTS，支持20.04+ LTS
 # GitHub: https://github.com/morhon-tech/morhon-odoo
 # 
@@ -50,19 +50,31 @@ DETECTED_DB_PASSWORD=""
 
 # 日志函数
 log() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    local line="${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+    echo -e "$line"
+    echo -e "$line" >> "$LOG_DIR/morhon-odoo.log" 2>/dev/null || true
 }
 
 log_error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log" >&2
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    local line="${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"
+    echo -e "$line" >&2
+    echo -e "$line" >> "$LOG_DIR/morhon-odoo.log" 2>/dev/null || true
 }
 
 log_info() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    local line="${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1"
+    echo -e "$line"
+    echo -e "$line" >> "$LOG_DIR/morhon-odoo.log" 2>/dev/null || true
 }
 
 log_warn() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | tee -a "$LOG_DIR/morhon-odoo.log"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    local line="${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1"
+    echo -e "$line"
+    echo -e "$line" >> "$LOG_DIR/morhon-odoo.log" 2>/dev/null || true
 }
 
 # 检查系统兼容性 - 仅支持Ubuntu
@@ -1348,7 +1360,7 @@ DOMAIN=$domain
 USE_WWW=$use_www
 
 # 版本信息
-SCRIPT_VERSION=6.2
+SCRIPT_VERSION=6.3
 ODOO_IMAGE=$ODOO_IMAGE
 POSTGRES_IMAGE=$POSTGRES_IMAGE
 EOF
@@ -2735,7 +2747,7 @@ backup_instance() {
 备份信息
 ========
 备份时间: $(date '+%Y-%m-%d %H:%M:%S')
-脚本版本: 6.2
+脚本版本: 6.3
 实例目录: $INSTANCE_DIR
 备份类型: 完整备份
 
@@ -2921,7 +2933,7 @@ optimize_existing_instance() {
 show_main_menu() {
     clear
     echo -e "${PURPLE}================================${NC}"
-    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.2${NC}"
+    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.3${NC}"
     echo -e "${PURPLE}================================${NC}"
     echo ""
     
@@ -3061,7 +3073,7 @@ if [ $# -ge 1 ]; then
             exit 0
             ;;
         "help"|"--help"|"-h")
-            echo "茂亨Odoo管理脚本 v6.2"
+            echo "茂亨Odoo管理脚本 v6.3"
             echo "专为外贸企业设计的Odoo部署和管理工具"
             echo ""
             echo "用法: $0 [命令]"
