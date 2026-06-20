@@ -2,7 +2,7 @@
 
 # 茂亨Odoo外贸专用版管理脚本 - Ubuntu专用版
 # 单实例版本，支持本地模式和域名模式
-# 版本: 6.3
+# 版本: 6.4
 # 系统要求: 推荐Ubuntu 24.04 LTS，支持20.04+ LTS
 # GitHub: https://github.com/morhon-tech/morhon-odoo
 # 
@@ -1360,7 +1360,7 @@ DOMAIN=$domain
 USE_WWW=$use_www
 
 # 版本信息
-SCRIPT_VERSION=6.3
+SCRIPT_VERSION=6.4
 ODOO_IMAGE=$ODOO_IMAGE
 POSTGRES_IMAGE=$POSTGRES_IMAGE
 EOF
@@ -2432,7 +2432,7 @@ manage_script_instance() {
     local choice
     while true; do
         show_management_menu
-        read -p "请选择操作 (1-8): " choice
+        read -p "请选择操作 (1-9): " choice
         
         case $choice in
             1) show_instance_status ;;
@@ -2442,11 +2442,12 @@ manage_script_instance() {
             5) modify_config ;;
             6) check_system_status ;;
             7) optimize_existing_instance ;;
-            8) return 1 ;;  # 返回主菜单
+            8) upgrade_instance ;;
+            9) return 1 ;;  # 返回主菜单
             *) log_error "无效选择" ;;
         esac
         
-        [ "$choice" -eq 8 ] && break
+        [ "$choice" -eq 9 ] && break
         echo ""
         read -p "按回车键继续..."
     done
@@ -2467,8 +2468,80 @@ show_management_menu() {
     echo "5) 修改配置"
     echo "6) 系统状态检查"
     echo "7) 性能优化"
-    echo "8) 返回主菜单"
+    echo "8) 升级（拉取新镜像并应用更新）"
+    echo "9) 返回主菜单"
     echo ""
+}
+
+# 升级实例（拉取新镜像并应用更新）
+# 仅重建 Odoo 容器，数据库容器保持不动；模块升级由镜像 entrypoint 在镜像版本
+# 变化时以单进程方式自动完成（含翻译重导），普通重启则秒级启动、不升级。
+upgrade_instance() {
+    echo ""
+    echo -e "${CYAN}升级茂亨Odoo（拉取新镜像并应用更新）${NC}"
+    echo "================================================"
+    echo ""
+    echo "此操作将："
+    echo "  1. 先备份当前实例（数据库 + 配置）"
+    echo "  2. 仅拉取最新 Odoo 镜像（数据库镜像不动）"
+    echo "  3. 仅重建 Odoo 容器，启动时自动单进程应用模块更新"
+    echo ""
+    echo "说明：数据库容器不会被重建，数据安全；升级期间 Odoo 会短暂停机，首次升级可能耗时几分钟。"
+
+    if ! confirm_action "确认开始升级？建议在业务低峰执行。"; then
+        log "已取消升级"
+        return 0
+    fi
+
+    if [ ! -f "$INSTANCE_DIR/docker-compose.yml" ]; then
+        log_error "未找到实例配置：$INSTANCE_DIR/docker-compose.yml"
+        return 1
+    fi
+
+    # 1. 升级前备份
+    log "升级前备份实例..."
+    backup_instance || log_warn "备份未完成，仍继续升级（请确认风险）"
+
+    cd "$INSTANCE_DIR" || { log_error "无法进入实例目录"; return 1; }
+
+    # 2. 仅拉取 Odoo 镜像（数据库镜像保持不变，避免 PG 大版本变化撞坏数据）
+    log "拉取最新 Odoo 镜像..."
+    if ! docker compose pull odoo; then
+        log_error "镜像拉取失败，已中止升级（实例未改动）"
+        return 1
+    fi
+
+    # 3. 仅重建 Odoo 容器（不动数据库）。镜像 entrypoint 会在镜像版本变化时
+    #    以单进程方式自动执行模块升级，普通重启则秒级启动。
+    log "重建 Odoo 容器并应用更新（容器内自动单进程升级，可能需几分钟）..."
+    if ! docker compose up -d --no-deps odoo; then
+        log_error "Odoo 容器重建失败，请检查：cd $INSTANCE_DIR && docker compose logs odoo"
+        return 1
+    fi
+
+    # 4. 等待服务就绪（首次升级需跑完单进程 -u all，耗时较长）
+    log "等待 Odoo 启动就绪（最多约 5 分钟）..."
+    local ready=false
+    local i
+    for i in $(seq 1 60); do
+        if docker compose logs --tail 100 odoo 2>/dev/null | grep -q "HTTP service (werkzeug) running"; then
+            ready=true
+            break
+        fi
+        sleep 5
+    done
+
+    echo ""
+    if [ "$ready" = true ]; then
+        log "✓ 升级完成，Odoo 已就绪"
+    else
+        log_warn "等待超时：升级可能仍在进行（首次升级耗时较长）。可用以下命令继续观察："
+        echo "  cd $INSTANCE_DIR && docker compose logs -f odoo"
+    fi
+
+    echo ""
+    docker compose ps
+    return 0
 }
 
 # 系统状态检查 - 专用服务器监控
@@ -2747,7 +2820,7 @@ backup_instance() {
 备份信息
 ========
 备份时间: $(date '+%Y-%m-%d %H:%M:%S')
-脚本版本: 6.3
+脚本版本: 6.4
 实例目录: $INSTANCE_DIR
 备份类型: 完整备份
 
@@ -2933,7 +3006,7 @@ optimize_existing_instance() {
 show_main_menu() {
     clear
     echo -e "${PURPLE}================================${NC}"
-    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.3${NC}"
+    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.4${NC}"
     echo -e "${PURPLE}================================${NC}"
     echo ""
     
@@ -3072,8 +3145,18 @@ if [ $# -ge 1 ]; then
             restore_from_backup
             exit 0
             ;;
+        "upgrade")
+            check_sudo
+            detect_environment
+            if [ "$DETECTED_INSTANCE_TYPE" = "script" ]; then
+                upgrade_instance
+            else
+                log_error "仅支持脚本管理的实例升级"
+            fi
+            exit 0
+            ;;
         "help"|"--help"|"-h")
-            echo "茂亨Odoo管理脚本 v6.3"
+            echo "茂亨Odoo管理脚本 v6.4"
             echo "专为外贸企业设计的Odoo部署和管理工具"
             echo ""
             echo "用法: $0 [命令]"
@@ -3083,6 +3166,7 @@ if [ $# -ge 1 ]; then
             echo "  init       初始化环境（安装Docker、Nginx等依赖）"
             echo "  backup     备份脚本管理的实例"
             echo "  restore    从备份恢复（自动检测同目录备份文件）"
+            echo "  upgrade    升级到最新镜像（拉取新镜像并应用更新，仅脚本实例）"
             echo "  status     显示实例状态"
             echo "  help       显示此帮助信息"
             echo ""
