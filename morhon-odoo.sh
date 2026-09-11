@@ -1,24 +1,48 @@
 #!/bin/bash
 
-# 茂亨Odoo外贸专用版管理脚本 - Ubuntu专用版
+# 茂亨Odoo外贸专用版部署脚本 - Ubuntu专用版
 # 单实例版本，支持本地模式和域名模式
-# 版本: 6.4
+# 版本: 7.0
 # 系统要求: 推荐Ubuntu 24.04 LTS，支持20.04+ LTS
 # GitHub: https://github.com/morhon-tech/morhon-odoo
-# 
-# 功能特性:
-# - 自动检测现有实例（脚本管理/手动部署）
-# - 支持本地模式和域名模式部署
-# - 自动SSL证书获取和配置
-# - 完整的备份和恢复功能
-# - 手动实例迁移到脚本管理
-# - 性能优化配置
-# - 安全加固设置
-# - 仅支持Ubuntu系统，确保最佳兼容性
+#
+# 这个脚本只做一件事：把茂亨Odoo部署起来，并让它能长期运行。
+#
+# 功能:
+# - 全新部署（内网 IP 模式 / 域名 + HTTPS 模式）
+# - 升级（拉取新镜像并应用更新）
+# - 备份与恢复
+# - 状态查看
+# - 仅支持Ubuntu系统
+#
+# 7.0 去掉了什么，以及为什么
+# ========================
+# 6.x 还会替客户做服务器运维：改内核参数与 ulimit、重写 /etc/docker/daemon.json、
+# 重置 ufw 防火墙、改 sshd_config 并重启 sshd、禁用十个系统服务、装
+# fail2ban/rkhunter/chkrootkit、开启 unattended-upgrades、**整份覆盖**
+# /etc/nginx/nginx.conf、写一批系统维护 cron，另外还带手动实例迁移和健康检查菜单。
+#
+# 那些都不是"部署这套系统"需要做的事，而且改的全是全局配置 —— 客户的服务器上往往
+# 还跑着别的东西，这些动作破坏性强且难以回退。其中两条尤其危险，已随之移除：
+#
+#   * `docker system prune -f --volumes` 每周日执行一次 —— 维护时只要停过容器，
+#     客户的数据库卷就可能被删掉；
+#   * `systemctl is-active docker nginx || systemctl restart docker nginx` 每 30
+#     分钟一次，而判断本身是错的（任一不活跃就重启**两个**），等于随时可能重启
+#     docker，把机器上全部容器一起带下去。
+#
+# Nginx 现在只往 /etc/nginx/conf.d/ 加一份 http 级片段，再加一份站点配置，不碰客户
+# 的 nginx.conf（理由见 create_nginx_shared_snippet 的说明）。
+#
+# 客户自己的服务器加固、内核调优、防火墙策略，交回给客户或他的运维决定。
 
 set -e
 
 # 配置变量
+# 版本号只在这里写一次：菜单标题、help、备份信息文件都读它。
+# 以前这三处各写一份字面量，改版本时漏掉两处 —— 备份文件里于是长期记着旧版本号，
+# 而备份信息正是出事时用来判断"这份备份是哪一版脚本做的"的依据。
+SCRIPT_VERSION="7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTANCE_DIR="/opt/morhon-odoo"
 BACKUP_DIR="/var/backups/morhon-odoo"
@@ -77,59 +101,42 @@ log_warn() {
     echo -e "$line" >> "$LOG_DIR/morhon-odoo.log" 2>/dev/null || true
 }
 
-# 检查系统兼容性 - 仅支持Ubuntu
+# 检查系统兼容性 - 仅支持 Ubuntu 20.04 以上
+#
+# 原来这里按 24.04 / 22.04 / 20.04 / 18.04 分了五个分支，各配一段推荐升级的说明文字。
+# 判断结果其实只有两种：够新就继续，太旧就退出 —— 那些文字不影响部署，反而藏了一个
+# 真错误：`[[ "$os_version" < "20.04" ]]` 是**字符串**比较（shellcheck SC2072）。
+# 现在按 major.minor 拆成整数比，一个分支说清楚。
 check_system_compatibility() {
     log_info "检查系统兼容性..."
-    
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        local os_name="$ID"
-        local os_version="$VERSION_ID"
-        
-        if [ "$os_name" != "ubuntu" ]; then
-            log_error "❌ 不支持的操作系统: $os_name"
-            log_error "本脚本仅支持Ubuntu系统"
-            log_error "推荐使用: Ubuntu 24.04 LTS（首选）/ 22.04 LTS / 20.04 LTS"
-            exit 1
-        fi
-        
-        case $os_version in
-            "24.04")
-                log "✓ 检测到最新推荐的Ubuntu 24.04 LTS版本（长期支持到2029年）"
-                log "🌟 您正在使用最佳性能版本，享受所有优化特性！"
-                ;;
-            "22.04")
-                log "✓ 检测到推荐的Ubuntu 22.04 LTS版本（长期支持到2027年）"
-                log "💡 建议升级到Ubuntu 24.04 LTS以获得25%性能提升和更长支持周期"
-                ;;
-            "20.04")
-                log "✓ 检测到Ubuntu 20.04 LTS版本（长期支持到2025年）"
-                log_warn "⚠ 建议升级到Ubuntu 24.04 LTS以获得更好的性能和更长的支持周期"
-                log_warn "  升级命令: sudo do-release-upgrade"
-                ;;
-            "18.04")
-                log_error "❌ Ubuntu 18.04 LTS已不再支持"
-                log_error "请升级到Ubuntu 24.04 LTS（推荐）或22.04 LTS"
-                log_error "升级命令: sudo do-release-upgrade -d"
-                exit 1
-                ;;
-            *)
-                if [[ "$os_version" < "20.04" ]]; then
-                    log_error "❌ Ubuntu版本过旧: $os_version"
-                    log_error "请升级到Ubuntu 24.04 LTS（推荐）或20.04 LTS以上版本"
-                    log_error "升级命令: sudo do-release-upgrade -d"
-                    exit 1
-                else
-                    log "✓ Ubuntu版本: $os_version"
-                    log_warn "⚠ 建议使用Ubuntu 24.04 LTS以获得最佳兼容性和性能"
-                    log_warn "  升级命令: sudo do-release-upgrade"
-                fi
-                ;;
-        esac
-    else
-        log_error "❌ 无法检测操作系统版本"
-        log_error "请确保在Ubuntu系统上运行此脚本"
+
+    if [ ! -f /etc/os-release ]; then
+        log_error "无法检测操作系统版本；本脚本仅支持 Ubuntu"
         exit 1
+    fi
+
+    . /etc/os-release
+    if [ "${ID:-}" != "ubuntu" ]; then
+        log_error "不支持的操作系统: ${ID:-未知}；本脚本仅支持 Ubuntu"
+        log_error "推荐 Ubuntu 24.04 LTS，最低 20.04 LTS"
+        exit 1
+    fi
+
+    local major="${VERSION_ID%%.*}"
+    local minor="${VERSION_ID##*.}"
+    # 去掉可能的前导零，免得 08 被当成八进制（`10#` 强制十进制）。
+    major=$((10#${major:-0}))
+    minor=$((10#${minor:-0}))
+
+    if [ "$major" -lt 20 ] || { [ "$major" -eq 20 ] && [ "$minor" -lt 4 ]; }; then
+        log_error "Ubuntu 版本过旧: ${VERSION_ID}；最低要求 20.04 LTS"
+        log_error "升级命令: sudo do-release-upgrade"
+        exit 1
+    fi
+
+    log "✓ Ubuntu ${VERSION_ID}"
+    if [ "$major" -lt 24 ]; then
+        log_warn "建议使用 Ubuntu 24.04 LTS（支持周期更长）"
     fi
 }
 
@@ -241,7 +248,8 @@ extract_odoo_config_info() {
 
 # 提取数据库密码
 extract_db_password() {
-    DETECTED_DB_PASSWORD=$(docker exec "$DETECTED_DB_CONTAINER" env 2>/dev/null | grep "POSTGRES_PASSWORD" | cut -d'=' -f2 || echo "odoo")
+    # -f2- : base64 密码以 '=' 结尾，-f2 会截断它（见 create_odoo_config 的说明）
+    DETECTED_DB_PASSWORD=$(docker exec "$DETECTED_DB_CONTAINER" env 2>/dev/null | grep "POSTGRES_PASSWORD" | cut -d'=' -f2- || echo "")
     log "提取到数据库密码"
 }
 
@@ -277,430 +285,66 @@ get_server_ip() {
 
 # 初始化环境 - 专用服务器优化
 init_environment() {
-    log "初始化专用服务器环境..."
-    
-    # 更新系统
-    log "更新系统包..."
+    log "安装部署依赖..."
+
+    # 只 update，不 upgrade。
+    #
+    # 原来这里有 `apt-get upgrade -y`，会把客户整台机器的包全升一遍。那不是安装
+    # 我们系统需要做的事，而且在生产机上是有风险的动作：内核、数据库客户端、客户
+    # 自己跑的别的服务都可能被带着走。什么时候升级系统由客户决定。
+    log "刷新软件包索引..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get upgrade -y
-    
-    # 安装系统依赖
+
+    # 依赖只留部署真正用到的：
+    #   nginx            反向代理（本地模式和域名模式都要）
+    #   certbot + 插件   域名模式签证书与续期
+    #   postgresql-client 备份与恢复用 pg_dump / pg_restore
+    #   openssl          create_env_file 生成数据库和管理员密码
+    #   curl/gnupg/lsb-release/ca-certificates  install_docker 加官方源要用
+    #   tar/gzip/unzip   镜像与备份文件解包
+    #
+    # 去掉的：ufw、fail2ban、rkhunter、chkrootkit、unattended-upgrades、htop、
+    # iotop、sysstat、bc、net-tools、git、python3-pip、software-properties-common、
+    # apt-transport-https。那些是给服务器做运维和加固的，装我们的系统不需要，
+    # 而配套那些工具的配置动作（改内核参数、重置防火墙、改 sshd_config、禁用系统
+    # 服务）在客户已有用途的机器上是破坏性的。
     log "安装系统依赖..."
     apt-get install -y \
+        ca-certificates \
         curl \
         wget \
-        git \
-        unzip \
+        gnupg \
+        lsb-release \
         tar \
         gzip \
-        python3 \
-        python3-pip \
+        unzip \
+        openssl \
         postgresql-client \
-        certbot \
-        python3-certbot-nginx \
         nginx \
-        ufw \
-        net-tools \
-        htop \
-        iotop \
-        sysstat \
-        bc \
-        software-properties-common \
-        apt-transport-https \
-        ca-certificates \
-        gnupg \
-        lsb-release
-    
-    # 安装Docker
+        certbot \
+        python3-certbot-nginx
+
     if ! command -v docker &> /dev/null; then
         install_docker
     fi
-    
-    # 安装Docker Compose (included with docker-compose-plugin)
+
+    # compose 插件是硬要求，不是提示：下面 create_docker_compose_config 生成的
+    # docker-compose.yml 全靠 `docker compose` 起。以前这里只 log_warn 一句就继续，
+    # 于是失败点被推到很后面，报错看起来和 compose 没关系。
     if ! docker compose version &> /dev/null; then
-        log_warn "docker compose 插件未安装，请确认 docker-compose-plugin 已安装"
+        log_error "docker compose 插件不可用；请确认 docker-compose-plugin 已安装"
+        return 1
     fi
-    
-    # 专用服务器系统优化
-    optimize_system_for_odoo
-    
-    # 配置防火墙
-    configure_firewall
-    
-    # 配置Nginx
-    configure_nginx
-    
-    log "专用服务器环境初始化完成"
+
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl enable nginx  >/dev/null 2>&1 || true
+
+    # Nginx 只往 conf.d 加一份片段，不改客户的 nginx.conf（理由见该函数说明）。
+    create_nginx_shared_snippet
+
+    log "部署依赖安装完成"
     return 0
-}
-
-# 专用服务器系统优化
-optimize_system_for_odoo() {
-    log "执行专用服务器系统优化..."
-    
-    # 获取系统资源信息
-    local cpu_cores=$(nproc)
-    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
-    local ubuntu_version=$(lsb_release -rs 2>/dev/null || echo "unknown")
-    
-    # Ubuntu 24.04 LTS特定优化
-    if [ "$ubuntu_version" = "24.04" ]; then
-        log "应用Ubuntu 24.04 LTS专用优化配置..."
-        
-        # Ubuntu 24.04的增强网络优化
-        cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
-# 茂亨Odoo外贸管理系统内核优化 - Ubuntu 24.04 LTS专用
-
-# 网络优化（Ubuntu 24.04增强版，外贸管理系统需要处理大量并发连接）
-net.core.somaxconn = 131072
-net.core.netdev_max_backlog = 30000
-net.ipv4.tcp_max_syn_backlog = 131072
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_rmem = 8192 131072 33554432
-net.ipv4.tcp_wmem = 8192 131072 33554432
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
-
-# 内存管理优化（Ubuntu 24.04增强版，外贸管理系统大数据处理）
-vm.swappiness = 1
-vm.dirty_ratio = 5
-vm.dirty_background_ratio = 2
-vm.overcommit_memory = 1
-vm.overcommit_ratio = 90
-vm.vfs_cache_pressure = 50
-vm.zone_reclaim_mode = 0
-
-# 文件系统优化（Ubuntu 24.04增强版，外贸管理系统文档处理）
-fs.file-max = 4194304
-fs.nr_open = 4194304
-fs.inotify.max_user_watches = 1048576
-fs.inotify.max_user_instances = 1024
-fs.aio-max-nr = 1048576
-
-# 进程优化（Ubuntu 24.04增强版）
-kernel.pid_max = 8388608
-kernel.threads-max = 8388608
-kernel.sched_migration_cost_ns = 5000000
-
-# 安全优化
-kernel.dmesg_restrict = 1
-kernel.kptr_restrict = 2
-kernel.yama.ptrace_scope = 1
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_rfc1337 = 1
-EOF
-    else
-        # 其他Ubuntu版本的标准优化
-        log "应用标准Ubuntu优化配置..."
-        cat > /etc/sysctl.d/99-morhon-odoo.conf << EOF
-# 茂亨Odoo外贸管理系统内核优化
-
-# 网络优化（外贸管理系统需要处理大量并发连接）
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 10000
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_rmem = 4096 65536 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-
-# 内存管理优化（外贸管理系统大数据处理）
-vm.swappiness = 1
-vm.dirty_ratio = 10
-vm.dirty_background_ratio = 3
-vm.overcommit_memory = 1
-vm.overcommit_ratio = 80
-vm.vfs_cache_pressure = 50
-
-# 文件系统优化（外贸管理系统文档处理）
-fs.file-max = 2097152
-fs.nr_open = 2097152
-fs.inotify.max_user_watches = 524288
-fs.inotify.max_user_instances = 512
-
-# 进程优化
-kernel.pid_max = 4194304
-kernel.threads-max = 4194304
-
-# 安全优化
-kernel.dmesg_restrict = 1
-kernel.kptr_restrict = 2
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
-net.ipv4.tcp_syncookies = 1
-EOF
-    fi
-    
-    # 应用内核参数
-    sysctl -p /etc/sysctl.d/99-morhon-odoo.conf
-    
-    # 系统限制优化
-    log "优化系统限制..."
-    if [ "$ubuntu_version" = "24.04" ]; then
-        # Ubuntu 24.04增强限制
-        cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
-# 茂亨Odoo专用服务器限制优化 - Ubuntu 24.04 LTS增强版
-* soft nofile 131072
-* hard nofile 131072
-* soft nproc 65536
-* hard nproc 65536
-* soft memlock unlimited
-* hard memlock unlimited
-root soft nofile 131072
-root hard nofile 131072
-www-data soft nofile 131072
-www-data hard nofile 131072
-EOF
-    else
-        # 标准限制配置
-        cat > /etc/security/limits.d/99-morhon-odoo.conf << EOF
-# 茂亨Odoo专用服务器限制优化
-* soft nofile 65536
-* hard nofile 65536
-* soft nproc 32768
-* hard nproc 32768
-root soft nofile 65536
-root hard nofile 65536
-www-data soft nofile 65536
-www-data hard nofile 65536
-EOF
-    fi
-    
-    # Docker优化
-    log "优化Docker配置..."
-    mkdir -p /etc/docker
-    if [ "$ubuntu_version" = "24.04" ]; then
-        # Ubuntu 24.04 Docker增强配置
-        cat > /etc/docker/daemon.json << EOF
-{
-    "log-driver": "json-file",
-    "log-opts": {
-        "max-size": "100m",
-        "max-file": "3"
-    },
-    "storage-driver": "overlay2",
-    "storage-opts": [
-        "overlay2.override_kernel_check=true"
-    ],
-    "default-ulimits": {
-        "nofile": {
-            "Name": "nofile",
-            "Hard": 131072,
-            "Soft": 131072
-        },
-        "nproc": {
-            "Name": "nproc",
-            "Hard": 65536,
-            "Soft": 65536
-        }
-    },
-    "max-concurrent-downloads": 10,
-    "max-concurrent-uploads": 5,
-    "default-shm-size": "128M",
-    "userland-proxy": false,
-    "experimental": false,
-    "features": {
-        "buildkit": true
-    }
-}
-EOF
-    else
-        # 标准Docker配置
-        cat > /etc/docker/daemon.json << EOF
-{
-    "log-driver": "json-file",
-    "log-opts": {
-        "max-size": "100m",
-        "max-file": "3"
-    },
-    "storage-driver": "overlay2",
-    "default-ulimits": {
-        "nofile": {
-            "Name": "nofile",
-            "Hard": 65536,
-            "Soft": 65536
-        },
-        "nproc": {
-            "Name": "nproc",
-            "Hard": 32768,
-            "Soft": 32768
-        }
-    }
-}
-EOF
-    fi
-    
-    # 重启Docker服务
-    systemctl restart docker
-    
-    # 磁盘I/O优化
-    log "优化磁盘I/O..."
-    # 检测磁盘类型并优化
-    for disk in $(lsblk -d -o name | grep -E '^[sv]d[a-z]$|^nvme'); do
-        if [ -b "/dev/$disk" ]; then
-            # SSD优化
-            echo noop > /sys/block/$disk/queue/scheduler 2>/dev/null || \
-            echo none > /sys/block/$disk/queue/scheduler 2>/dev/null || true
-            echo 0 > /sys/block/$disk/queue/rotational 2>/dev/null || true
-            echo 1 > /sys/block/$disk/queue/iosched/fifo_batch 2>/dev/null || true
-        fi
-    done
-    
-    # 日志轮转优化
-    log "配置日志轮转..."
-    cat > /etc/logrotate.d/morhon-odoo << EOF
-/var/log/morhon-odoo/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 644 root root
-}
-
-/var/log/nginx/morhon-odoo-*.log {
-    daily
-    missingok
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 644 www-data www-data
-    postrotate
-        systemctl reload nginx > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-    
-    # 定时任务优化 - 外贸管理系统专用
-    log "配置系统维护任务（外贸管理系统专用）..."
-    cat > /etc/cron.d/morhon-odoo-maintenance << EOF
-# 茂亨Odoo外贸管理系统维护任务
-
-# 每天凌晨2点清理系统缓存（避开工作时间）
-0 2 * * * root sync && echo 3 > /proc/sys/vm/drop_caches
-
-# 每周日凌晨3点清理Docker（周末维护）
-0 3 * * 0 root docker system prune -f --volumes
-
-# 每天凌晨4点备份数据库索引统计
-0 4 * * * root docker exec morhon-odoo-db psql -U odoo -d postgres -c "ANALYZE;" >/dev/null 2>&1
-
-# 每天上午6点检查磁盘空间
-0 6 * * * root df -h | awk '\$5 > 85 {print "Warning: " \$0}' | mail -s "Disk Space Warning" root 2>/dev/null || true
-
-# 每天检查外贸管理系统关键进程
-*/30 * * * * root systemctl is-active docker nginx >/dev/null || systemctl restart docker nginx
-
-# 每周清理Nginx日志（保留30天）
-0 1 * * 1 root find /var/log/nginx/ -name "*.log" -mtime +30 -delete
-EOF
-    
-    # 禁用不必要的服务（外贸管理系统安全加固）
-    log "禁用不必要的服务（外贸管理系统安全加固）..."
-    local services_to_disable=(
-        "snapd"
-        "bluetooth"
-        "cups"
-        "avahi-daemon"
-        "ModemManager"
-        "whoopsie"
-        "apport"
-        "accounts-daemon"
-        "fwupd"
-        "packagekit"
-    )
-    
-    for service in "${services_to_disable[@]}"; do
-        if systemctl is-enabled "$service" >/dev/null 2>&1; then
-            systemctl disable "$service" >/dev/null 2>&1 || true
-            systemctl stop "$service" >/dev/null 2>&1 || true
-            log "已禁用服务: $service"
-        fi
-    done
-    
-    # 安装并配置安全工具
-    log "安装安全工具..."
-    apt-get install -y fail2ban rkhunter chkrootkit unattended-upgrades
-    
-    # 配置自动安全更新
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades << EOF
-Unattended-Upgrade::Allowed-Origins {
-    "\${distro_id}:\${distro_codename}-security";
-    "\${distro_id}ESMApps:\${distro_codename}-apps-security";
-    "\${distro_id}ESM:\${distro_codename}-infra-security";
-};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
-    
-    # 启用自动更新
-    systemctl enable unattended-upgrades
-    
-    # 配置SSH安全
-    if [ -f "/etc/ssh/sshd_config" ]; then
-        log "加固SSH配置..."
-        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-        
-        # SSH安全配置
-        # Only disable root login if there are other sudo-capable users
-        local sudo_users=$(grep -E '^sudo:' /etc/group | cut -d: -f4 | tr ',' '\n' | grep -v '^$' | wc -l)
-        if [ "$sudo_users" -gt 0 ]; then
-            sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
-            log "已禁用root SSH登录（检测到 $sudo_users 个sudo用户）"
-        else
-            log_warn "未检测到其他sudo用户，保留root SSH登录以防锁定"
-        fi
-        sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-        sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
-        sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
-        sed -i 's/#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
-        
-        # 重启SSH服务
-        systemctl restart sshd
-    fi
-    
-    # 优化启动服务
-    log "优化系统启动..."
-    systemctl enable docker
-    systemctl enable nginx
-    
-    log "专用服务器系统优化完成"
 }
 
 # 安装Docker - 仅支持Ubuntu
@@ -715,22 +359,7 @@ install_docker() {
             return 1
         fi
         
-        # Ubuntu版本提示
-        case $VERSION_ID in
-            "24.04")
-                log "在Ubuntu 24.04 LTS上安装Docker（最新推荐版本）..."
-                ;;
-            "22.04")
-                log "在Ubuntu 22.04 LTS上安装Docker（推荐版本）..."
-                ;;
-            "20.04")
-                log "在Ubuntu 20.04 LTS上安装Docker..."
-                log_warn "建议升级到Ubuntu 24.04 LTS以获得更好的Docker支持"
-                ;;
-            *)
-                log_warn "Ubuntu版本: $VERSION_ID，强烈推荐使用24.04 LTS"
-                ;;
-        esac
+        log "在 Ubuntu ${VERSION_ID} 上安装 Docker..."
     else
         log_error "无法检测操作系统类型"
         return 1
@@ -758,243 +387,60 @@ install_docker() {
     log "Docker安装完成"
 }
 
-# 安装Docker Compose（已包含在 docker-compose-plugin 中）
-install_docker_compose() {
-    log "Docker Compose 已通过 docker-compose-plugin 安装"
-}
+# Nginx 的 http 级片段：只往 conf.d 加一份文件，不改客户的 nginx.conf
+#
+# 为什么不再改写 /etc/nginx/nginx.conf
+# --------------------------------
+# 原来的 configure_nginx() 会**整份覆盖** /etc/nginx/nginx.conf。在一台只跑我们
+# 系统的机器上看不出问题，但客户的服务器上常常还有别的站点，覆盖等于把别人的配置
+# 一起换掉，而且是不可逆的（只留一份 .backup）。
+#
+# Ubuntu 自带的 nginx.conf 在 http 段里本来就有
+# `include /etc/nginx/conf.d/*.conf;`，所以我们把需要的 http 级指令放成 conf.d 下
+# 的一份文件 —— 加进去，而不是换掉。
+#
+# 这份片段不是可选的美化，缺了 nginx 直接起不来
+# ------------------------------------------
+# create_nginx_domain_config / create_nginx_local_config 生成的站点配置里用了
+# `limit_conn conn_limit_per_ip`、`limit_req zone=req_limit_per_ip`、
+# `proxy_cache odoo_cache`，而 zone 和 cache 只能在 **http 级**声明。
+# 删掉这份片段，`nginx -t` 会直接报 unknown zone / no such cache。
+create_nginx_shared_snippet() {
+    log "写入 Nginx http 级片段: /etc/nginx/conf.d/morhon-odoo.conf"
 
-# 配置防火墙 - 生产环境安全加固
-configure_firewall() {
-    log "配置防火墙（生产环境安全加固）..."
-    
-    # 重置防火墙规则
-    ufw --force reset
-    
-    # 默认策略
-    ufw default deny incoming
-    ufw default allow outgoing
-    
-    # 允许SSH（限制连接数）
-    ufw limit 22/tcp comment 'SSH with rate limiting'
-    log "已配置SSH端口 (22/tcp) 带连接限制"
-    
-    # 允许HTTP（内网和公网都需要）
-    ufw allow 80/tcp comment 'HTTP for Odoo'
-    log "已允许HTTP端口 (80/tcp)"
-    
-    # 允许HTTPS（公网必需，内网可选）
-    ufw allow 443/tcp comment 'HTTPS for Odoo'
-    log "已允许HTTPS端口 (443/tcp)"
-    
-    # 拒绝常见攻击端口（生产环境安全）
-    ufw deny 23/tcp comment 'Block Telnet'
-    ufw deny 135/tcp comment 'Block RPC'
-    ufw deny 139/tcp comment 'Block NetBIOS'
-    ufw deny 445/tcp comment 'Block SMB'
-    ufw deny 1433/tcp comment 'Block MSSQL'
-    ufw deny 3389/tcp comment 'Block RDP'
-    ufw deny 5432/tcp comment 'Block PostgreSQL direct access'
-    ufw deny 6379/tcp comment 'Block Redis direct access'
-    ufw deny 8069/tcp comment 'Block Odoo direct access'
-    ufw deny 8072/tcp comment 'Block Odoo longpolling direct access'
-    
-    # 配置日志记录
-    ufw logging on
-    
-    # 启用UFW
-    ufw --force enable
-    
-    # 创建fail2ban配置（如果安装了）
-    if command -v fail2ban-server &> /dev/null; then
-        configure_fail2ban
-    else
-        log "建议安装fail2ban增强安全防护"
-    fi
-    
-    log "防火墙配置完成（生产环境安全加固）"
-    log "注意: 已阻止Odoo和数据库的直接访问，仅允许通过Nginx代理"
-}
-
-# 配置fail2ban（如果可用）
-configure_fail2ban() {
-    log "配置fail2ban..."
-    
-    cat > /etc/fail2ban/jail.d/morhon-odoo.conf << EOF
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 3
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-
-[nginx-http-auth]
-enabled = true
-filter = nginx-http-auth
-port = http,https
-logpath = /var/log/nginx/error.log
-maxretry = 3
-
-[nginx-limit-req]
-enabled = true
-filter = nginx-limit-req
-port = http,https
-logpath = /var/log/nginx/error.log
-maxretry = 10
-EOF
-
-    systemctl restart fail2ban 2>/dev/null || true
-    log "fail2ban配置完成"
-}
-
-# 配置Nginx - 专用服务器优化
-configure_nginx() {
-    log "配置Nginx（专用服务器优化）..."
-    
-    # 备份原始配置
-    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
-    
-    # 获取系统资源信息
-    local cpu_cores=$(nproc)
-    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
-    
-    # 专用服务器优化参数
-    local worker_processes=$cpu_cores
-    local worker_connections=$((cpu_cores * 2048))  # 每个CPU核心2048连接
-    local worker_rlimit_nofile=$((worker_connections * 2))
-    
-    # 创建专用服务器优化的nginx配置
-    tee /etc/nginx/nginx.conf > /dev/null << EOF
-# 茂亨Odoo专用服务器Nginx配置
-user www-data;
-worker_processes $worker_processes;
-worker_rlimit_nofile $worker_rlimit_nofile;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections $worker_connections;
-    multi_accept on;
-    use epoll;
-    accept_mutex off;
-}
-
-http {
-    # 基本设置
-    sendfile on;
-    sendfile_max_chunk 1m;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 75s;
-    keepalive_requests 1000;
-    types_hash_max_size 2048;
-    server_tokens off;
-    
-    # 专用服务器优化
-    open_file_cache max=10000 inactive=60s;
-    open_file_cache_valid 120s;
-    open_file_cache_min_uses 2;
-    open_file_cache_errors on;
-    
-    # MIME类型
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-    
-    # 日志格式优化
-    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
-                    '\$status \$body_bytes_sent "\$http_referer" '
-                    '"\$http_user_agent" "\$http_x_forwarded_for" '
-                    'rt=\$request_time uct="\$upstream_connect_time" '
-                    'uht="\$upstream_header_time" urt="\$upstream_response_time"';
-    
-    access_log /var/log/nginx/access.log main buffer=64k flush=5s;
-    error_log /var/log/nginx/error.log warn;
-    
-    # 外贸管理系统优化 - 大文件支持
-    client_max_body_size 500M;
-    client_body_buffer_size 128k;
-    client_header_buffer_size 4k;
-    large_client_header_buffers 8 16k;
-    client_body_timeout 300s;
-    client_header_timeout 60s;
-    send_timeout 300s;
-    
-    # 代理优化
-    proxy_connect_timeout 60s;
-    proxy_send_timeout 300s;
-    proxy_read_timeout 300s;
-    proxy_buffer_size 64k;
-    proxy_buffers 32 64k;
-    proxy_busy_buffers_size 128k;
-    proxy_temp_file_write_size 128k;
-    proxy_max_temp_file_size 1024m;
-    
-    # Gzip压缩优化
-    gzip on;
-    gzip_vary on;
-    gzip_proxied any;
-    gzip_comp_level 6;
-    gzip_min_length 1000;
-    gzip_types
-        text/plain
-        text/css
-        text/xml
-        text/javascript
-        text/csv
-        application/json
-        application/javascript
-        application/xml+rss
-        application/atom+xml
-        application/rdf+xml
-        application/rss+xml
-        application/geo+json
-        application/ld+json
-        application/manifest+json
-        application/x-web-app-manifest+json
-        image/svg+xml;
-    
-    # 缓存优化
-    proxy_cache_path /var/cache/nginx/odoo levels=1:2 keys_zone=odoo_cache:100m max_size=1g inactive=60m use_temp_path=off;
-    
-    # SSL优化
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:50m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    
-    # 连接限制 - 外贸管理系统防护
-    limit_conn_zone \$binary_remote_addr zone=conn_limit_per_ip:10m;
-    limit_req_zone \$binary_remote_addr zone=req_limit_per_ip:10m rate=20r/s;
-    
-    # 包含其他配置
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-    
-    # 创建缓存目录
-    mkdir -p /var/cache/nginx/odoo
+    mkdir -p /etc/nginx/conf.d /var/cache/nginx/odoo
     chown -R www-data:www-data /var/cache/nginx/odoo
-    
-    # 创建站点目录
-    mkdir -p /etc/nginx/sites-available
-    mkdir -p /etc/nginx/sites-enabled
-    
-    # 测试配置
-    nginx -t
-    
-    # 重启Nginx
-    systemctl restart nginx
-    
-    log "Nginx专用服务器配置完成"
+
+    cat > /etc/nginx/conf.d/morhon-odoo.conf << 'NGINX_SHARED'
+# 茂亨Odoo —— Nginx http 级片段。由 morhon-odoo.sh 生成，请勿手工修改。
+# 站点配置 sites-available/morhon-odoo 引用这里声明的 zone 与 cache。
+
+proxy_cache_path /var/cache/nginx/odoo levels=1:2 keys_zone=odoo_cache:100m max_size=1g inactive=60m use_temp_path=off;
+limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:10m;
+limit_req_zone  $binary_remote_addr zone=req_limit_per_ip:10m rate=20r/s;
+
+# 站点配置里写着 `access_log ... main`，而 Ubuntu 自带的 nginx.conf 只有默认的
+# combined 格式，没有 main —— 少了这段 nginx 会 emerg: unknown log format "main"。
+# 带上游耗时是有用的：排查"Odoo 慢"时能直接分开是 nginx 等后端还是后端本身慢。
+log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                '$status $body_bytes_sent "$http_referer" '
+                '"$http_user_agent" "$http_x_forwarded_for" '
+                'rt=$request_time uct="$upstream_connect_time" '
+                'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+# 大附件：外贸单据常带图纸和报关文件。站点配置里也设了同样的值，这里留一份兜底，
+# 免得漏配时 nginx 用 1M 默认值把上传截断（表现是保存附件失败，不易联想到 nginx）。
+client_max_body_size 500M;
+client_body_timeout 300s;
+send_timeout 300s;
+NGINX_SHARED
+
+    if ! nginx -t; then
+        log_error "Nginx 配置检查未通过，请看上面的输出"
+        return 1
+    fi
+    # 首次安装时 nginx 可能还没起来，reload 会失败 —— 那种情况下 start 一下。
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
 }
 
 # 创建Docker卷
@@ -1054,18 +500,37 @@ generate_docker_compose() {
     mkdir -p "$INSTANCE_DIR/backups"
     mkdir -p "$INSTANCE_DIR/logs"
     
+    # 顺序是有讲究的：先 .env，再 odoo.conf。
+    #
+    # create_odoo_config() **读** .env 拿数据库和管理员密码，而且刻意不带兜底弱口令
+    # （理由写在那个函数里）。原来的顺序是先 odoo.conf 再 .env —— 全新安装时 .env
+    # 还不存在，于是那个守卫正确地拒绝，整个全新部署走不下去：
+    #
+    #   ERROR: 无法从 /opt/morhon-odoo/.env 读取 DB_PASSWORD / ADMIN_PASSWORD
+    #   ERROR: 拒绝用默认弱口令生成 odoo.conf
+    #
+    # 守卫是对的，顺序是错的。在一台干净的 Ubuntu 24.04 上实测复现过。
+    create_env_file "$deployment_type" "$domain" "$use_www"
+
     # 创建odoo配置文件
     create_odoo_config "$workers" "$total_mem"
-    
+
     # 创建docker-compose.yml
     create_docker_compose_config
     
-    # 创建环境变量文件
-    create_env_file "$deployment_type" "$domain" "$use_www"
-    
-    # 根据部署类型创建Nginx配置
+    # 根据部署类型创建 Nginx 配置
+    #
+    # 域名模式在这一步**只能**上 HTTP 配置，不能上带 SSL 的那份。
+    #
+    # 带 SSL 的配置里 `ssl_certificate` 指向 /etc/letsencrypt/live/$domain/…，
+    # 而此刻证书还没签出来 —— 那份配置 nginx 根本加载不了。而 certbot --webroot
+    # 又要靠一个**正在运行的** nginx 把 /.well-known/acme-challenge/ 送出去，
+    # 才能签下证书。先上 SSL 配置就把自己锁死了。
+    #
+    # 正确顺序（标准 webroot 流程）：HTTP 配置 -> reload -> 签证书 -> 换成 SSL 配置
+    # -> reload。后三步在 create_new_instance 里，那里才知道证书签成功了没有。
     if [ "$deployment_type" = "domain" ]; then
-        create_nginx_domain_config "$domain" "$use_www"
+        create_nginx_http_config "$domain" "$use_www"
     else
         create_nginx_local_config
     fi
@@ -1108,12 +573,25 @@ create_odoo_config() {
     local workers="$1"
     local total_mem="$2"
     
-    # Read passwords from .env file if it exists, otherwise use defaults
-    local db_password="odoo"
-    local admin_password="admin"
+    # 密码只能来自 .env（create_env_file 用 openssl rand 生成并写入）。
+    #
+    # 这里绝不能有兜底默认口令。admin_passwd 是 Odoo 的主密码，能创建、删除、
+    # 还原任意数据库；一旦 .env 缺失就静默降级成弱口令写进配置，等于把整台实例
+    # 交出去，而且没有任何提示，没人会发现。宁可装不上，也不要装成一个弱口令。
+    #
+    # cut 用 -f2- 而不是 -f2：openssl rand -base64 32 产生的值以 '=' 结尾
+    # （base64 填充），-f2 会把末尾的 '=' 截掉，于是 .env 里是完整密码、
+    # odoo.conf 里是残缺密码，Odoo 连不上数据库。
+    local db_password=""
+    local admin_password=""
     if [ -f "$INSTANCE_DIR/.env" ]; then
-        db_password=$(grep "^DB_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2)
-        admin_password=$(grep "^ADMIN_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2)
+        db_password=$(grep "^DB_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2-)
+        admin_password=$(grep "^ADMIN_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2-)
+    fi
+    if [ -z "$db_password" ] || [ -z "$admin_password" ]; then
+        log_error "无法从 $INSTANCE_DIR/.env 读取 DB_PASSWORD / ADMIN_PASSWORD"
+        log_error "拒绝用默认弱口令生成 odoo.conf。请确认该文件存在且包含这两个键。"
+        exit 1
     fi
     
     # 内存限制（Odoo 17 使用字节）
@@ -1341,8 +819,27 @@ create_env_file() {
     local deployment_type="$1"
     local domain="$2"
     local use_www="$3"
-    local db_password="${DETECTED_DB_PASSWORD:-$(openssl rand -base64 32)}"
-    local admin_password="$(openssl rand -base64 24)"
+    # 已有 .env 就沿用里面的密码，不重新生成。
+    #
+    # 重新生成 DB_PASSWORD 会把客户锁在自己的数据库外面：Postgres 数据卷里存的仍是
+    # 旧密码，而 .env 换成了新的，Odoo 于是连不上一个数据完好的库 —— 现象是"重装/
+    # 恢复之后系统打不开了"，而真正原因从报错里看不出来。
+    #
+    # cut 用 -f2- 而不是 -f2：openssl rand -base64 的值以 '=' 结尾，-f2 会截断它。
+    local db_password="" admin_password=""
+    if [ -f "$INSTANCE_DIR/.env" ]; then
+        db_password=$(grep "^DB_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2-)
+        admin_password=$(grep "^ADMIN_PASSWORD=" "$INSTANCE_DIR/.env" | cut -d'=' -f2-)
+        if [ -n "$db_password" ]; then
+            log "沿用 .env 中已有的密码（不重新生成，避免连不上已有数据库）"
+        fi
+    fi
+    if [ -z "$db_password" ]; then
+        db_password="${DETECTED_DB_PASSWORD:-$(openssl rand -base64 32)}"
+    fi
+    if [ -z "$admin_password" ]; then
+        admin_password="$(openssl rand -base64 24)"
+    fi
     
     cat > "$INSTANCE_DIR/.env" << EOF
 # 茂亨Odoo环境变量配置
@@ -1359,8 +856,8 @@ DEPLOYMENT_TYPE=$deployment_type
 DOMAIN=$domain
 USE_WWW=$use_www
 
-# 版本信息
-SCRIPT_VERSION=6.4
+# 版本信息（写进 .env 是为了以后能看出这套实例是哪一版脚本部署的）
+SCRIPT_VERSION=$SCRIPT_VERSION
 ODOO_IMAGE=$ODOO_IMAGE
 POSTGRES_IMAGE=$POSTGRES_IMAGE
 EOF
@@ -1552,24 +1049,21 @@ EOF
 # 创建Nginx本地配置 - 内网生产环境优化
 create_nginx_local_config() {
     local config_file="/etc/nginx/sites-available/morhon-odoo"
+    local snippet="/etc/nginx/snippets/morhon-odoo-app.conf"
     local server_ip=$(get_server_ip)
-    
-    tee "$config_file" > /dev/null << EOF
-# 茂亨Odoo内网生产环境配置 - 通过IP访问
 
-# Upstream 定义
-upstream odoo_backend {
-    server 127.0.0.1:8069;
-}
+    # 让 443 也能用。内网 IP 拿不到公信证书（Let's Encrypt 不给私网地址签，
+    # 也没有域名可验），所以只能自签 —— 浏览器会提示不受信任，点继续即可。
+    create_self_signed_cert "$server_ip"
 
-upstream odoo_longpolling {
-    server 127.0.0.1:8072;
-}
-
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    
+    # 80 和 443 共用的那一大段（连接限制、安全头、代理参数、全部 location、日志）
+    # 抽成 include 片段，两个 server 块各 include 一次。
+    #
+    # 不复制两份：复制迟早分叉，而分叉的表现是「HTTP 能传大附件、HTTPS 不能」
+    # 这种只在一半场景出现、又很难联想到 nginx 的怪毛病。
+    mkdir -p /etc/nginx/snippets
+    tee "$snippet" > /dev/null << EOF
+# 茂亨Odoo —— 80/443 共用的 server 级配置。由 morhon-odoo.sh 生成，请勿手工修改。
     # 内网生产环境连接限制
     limit_conn conn_limit_per_ip 100;
     limit_req zone=req_limit_per_ip burst=200 nodelay;
@@ -1665,16 +1159,91 @@ server {
     # 生产环境日志优化
     access_log /var/log/nginx/morhon-odoo-access.log main buffer=64k flush=5s;
     error_log /var/log/nginx/morhon-odoo-error.log;
+EOF
+
+    tee "$config_file" > /dev/null << EOF
+# 茂亨Odoo内网生产环境配置 - 通过IP访问
+# 由 morhon-odoo.sh 生成，请勿手工修改
+
+# Upstream 定义
+upstream odoo_backend {
+    server 127.0.0.1:8069;
+}
+
+upstream odoo_longpolling {
+    server 127.0.0.1:8072;
+}
+
+# HTTP —— 主入口，直接用 IP 打开就是这个。
+#
+# 刻意**不**跳转到 HTTPS：内网只有自签证书，强制跳转会让每个人每次访问都先
+# 撞一次浏览器警告，等于把「输个 IP 就能用」这件事弄坏。要加密的人自己走 https。
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    include $snippet;
+}
+
+# HTTPS —— 可选。自签证书，浏览器会提示「不安全」，属于预期现象。
+# 想要不报警的证书需要一个真实域名，用域名模式部署即可（那条路会签 Let's Encrypt）。
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+
+    ssl_certificate     $INSTANCE_DIR/ssl/fullchain.pem;
+    ssl_certificate_key $INSTANCE_DIR/ssl/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    include $snippet;
 }
 EOF
 
     # 启用站点
     ln -sf "$config_file" "/etc/nginx/sites-enabled/"
     rm -f /etc/nginx/sites-enabled/default
-    
+
     log "Nginx内网生产环境配置创建完成"
     log "内网访问地址: http://$server_ip"
+    log "            https://$server_ip（自签证书，浏览器会提示不受信任）"
     log "注意: 这是生产环境配置，请确保内网安全策略"
+}
+
+# 自签 SSL 证书（内网 IP 模式用）
+#
+# 为什么只能自签：Let's Encrypt 不给私网 IP 签证书（无法做域名验证），而内网
+# 部署本来就没有域名。要「不报警」的证书只有两条路 —— 用域名模式部署，或者客户
+# 自己买一张证书替换掉这里的两个文件。
+#
+# 有效期给 10 年：自签证书没有续期机制，给短了就等着某天悄悄过期。它本来就不
+# 被信任，有效期长短不影响浏览器的提示。
+create_self_signed_cert() {
+    local ip="$1"
+    local dir="$INSTANCE_DIR/ssl"
+
+    mkdir -p "$dir"
+
+    # 已有且离到期还有 30 天以上就不动 —— 重跑部署不该换掉证书
+    # （换了的话已经点过「信任」的浏览器又要再来一次）。
+    if [ -f "$dir/fullchain.pem" ] \
+       && openssl x509 -checkend 2592000 -noout -in "$dir/fullchain.pem" >/dev/null 2>&1; then
+        log "自签证书已存在且有效，沿用"
+        return 0
+    fi
+
+    log "生成自签 SSL 证书（CN=$ip）..."
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+            -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" \
+            -subj "/CN=$ip" \
+            -addext "subjectAltName=IP:$ip,DNS:localhost" >/dev/null 2>&1; then
+        log_error "自签证书生成失败；将只提供 HTTP 访问"
+        return 1
+    fi
+    chmod 600 "$dir/privkey.pem"
+    chmod 644 "$dir/fullchain.pem"
+    log "自签证书已生成: $dir/fullchain.pem（10 年有效）"
 }
 
 # 获取SSL证书
@@ -1710,8 +1279,12 @@ get_ssl_certificate() {
         $domain_args \
         --non-interactive \
         --agree-tos \
-        --email "admin@$domain" \
-        --force-renewal; then
+        --email "admin@$domain"; then
+        # 去掉了 --force-renewal。它的作用是"即使证书还没到期也重新签一张"，
+        # 而 Let's Encrypt 对**完全相同的域名组合**限制每周 5 张。客户重装或重试
+        # 几次就会撞上 "too many certificates already issued"，那时连正常部署都
+        # 签不出证书，而错误信息完全看不出是自己刷掉的。certbot 默认就是幂等的：
+        # 已有有效证书会直接复用。
         log "SSL证书获取成功"
         
         # 设置自动续期
@@ -1725,16 +1298,51 @@ get_ssl_certificate() {
 }
 
 # 设置SSL证书自动续期
+# 设置SSL自动续期
+#
+# 关键点：reload nginx 必须挂在 **deploy hook** 上，不能靠我们自己 cron 里的 --post-hook。
+#
+# 原来这里写的是：
+#     0 2 * * * root certbot renew --quiet --post-hook "systemctl reload nginx"
+#
+# 而 --post-hook 只在**本次调用真的续期了**才执行。Ubuntu 的 certbot 包自带
+# certbot.timer（每天跑两次）和 /etc/cron.d/certbot —— 它们会先把证书续掉，于是我们
+# 凌晨 2 点这条发现"未到期"，post-hook 根本不触发，nginx 永远不 reload。
+#
+# 后果很隐蔽：第 60 天证书在磁盘上换成新的，nginx 内存里还是旧的；到第 90 天浏览器开始
+# 报证书过期，而 `certbot certificates` 显示一切正常，排查方向完全被带偏。
+#
+# renewal-hooks/deploy/ 下的脚本在**任何一次成功续期之后**都会执行，不管是谁触发的。
 setup_ssl_renewal() {
     local domain="$1"
-    
-    # 创建续期脚本
-    cat > /etc/cron.d/certbot-renewal << EOF
-# 每天凌晨2点检查证书续期
-0 2 * * * root certbot renew --quiet --post-hook "systemctl reload nginx"
-EOF
-    
-    log "SSL证书自动续期已设置"
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+
+    mkdir -p "$hook_dir"
+    cat > "$hook_dir/10-reload-nginx.sh" << 'HOOK'
+#!/bin/sh
+# 由 morhon-odoo.sh 生成。证书每次成功续期后由 certbot 自动执行。
+# 不加 --quiet 之类的判断：这里只做一件事，让 nginx 用上新证书。
+systemctl reload nginx 2>/dev/null || systemctl restart nginx
+HOOK
+    chmod +x "$hook_dir/10-reload-nginx.sh"
+
+    # 续期本身交给 certbot 自带的定时器。多一条我们自己的 cron 只会让"谁先跑"变得
+    # 不确定，而正是那个不确定让旧的 --post-hook 失效。
+    if systemctl is-enabled certbot.timer >/dev/null 2>&1; then
+        rm -f /etc/cron.d/certbot-renewal
+        log "证书续期: certbot.timer（每日两次），续期后由 deploy hook 自动 reload nginx"
+    elif [ -f /etc/cron.d/certbot ]; then
+        rm -f /etc/cron.d/certbot-renewal
+        log "证书续期: certbot 自带 cron，续期后由 deploy hook 自动 reload nginx"
+    else
+        # 没有自带定时器（certbot 用别的方式装的），才保留我们自己这条 ——
+        # 否则删掉它就等于完全没有续期了。
+        cat > /etc/cron.d/certbot-renewal << 'CRON'
+# 每天凌晨 2 点检查续期。reload 由 renewal-hooks/deploy 负责，这里不再用 --post-hook。
+0 2 * * * root certbot renew --quiet
+CRON
+        log "未发现 certbot 自带定时器，已写入 /etc/cron.d/certbot-renewal"
+    fi
 }
 
 # 创建HTTP模式的Nginx配置（SSL获取失败时的备用方案）
@@ -1815,112 +1423,6 @@ EOF
     log "Nginx HTTP配置创建完成（SSL备用方案）"
 }
 
-# 迁移手动部署实例到脚本管理
-migrate_manual_instance() {
-    log "开始迁移手动部署实例..."
-    
-    # 确认迁移
-    if ! confirm_action "迁移操作将执行以下步骤:\n  1. 备份现有数据\n  2. 停止并删除旧容器\n  3. 创建脚本管理实例\n  4. 恢复数据到新实例"; then
-        log "取消迁移"
-        return 1
-    fi
-    
-    # 备份现有数据
-    local backup_timestamp=$(date '+%Y%m%d_%H%M%S')
-    local backup_path="$BACKUP_DIR/migration_$backup_timestamp"
-    mkdir -p "$backup_path"
-    
-    log "备份现有数据..."
-    backup_existing_data "$backup_path"
-    
-    # 询问部署模式
-    local deployment_type domain use_www
-    get_deployment_info "$deployment_type" "$domain" "$use_www"
-    
-    # 停止并删除旧容器
-    log "清理旧容器..."
-    cleanup_old_containers
-    
-    # 创建新的脚本管理实例
-    log "创建新实例..."
-    create_new_instance "$deployment_type" "$domain" "$use_www"
-    
-    # 恢复数据库（如果有备份）
-    restore_database_backup "$backup_path"
-    
-    # 专用服务器优化
-    optimize_migrated_instance
-    
-    # 重启Nginx
-    systemctl reload nginx
-    
-    log "迁移完成！"
-    show_deployment_info "$deployment_type" "$domain" "$backup_path"
-    
-    return 0
-}
-
-# 迁移实例后的专用服务器优化
-optimize_migrated_instance() {
-    log "执行迁移实例的专用服务器优化..."
-    
-    # 系统优化（如果还没有执行过）
-    if [ ! -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
-        optimize_system_for_odoo
-    fi
-    
-    # 重新生成优化的配置文件
-    log "重新生成优化配置..."
-    local cpu_cores=$(nproc)
-    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
-    local workers=$(calculate_workers "$cpu_cores" "$total_mem")
-    
-    # 更新Odoo配置
-    create_odoo_config "$workers" "$total_mem"
-    
-    # 更新Docker Compose配置
-    create_docker_compose_config
-    
-    # 重启容器以应用新配置
-    cd "$INSTANCE_DIR"
-    docker compose down
-    docker compose up -d
-    
-    # 等待服务启动
-    log "等待优化后的服务启动..."
-    sleep 10
-    
-    # 数据库优化
-    optimize_database_after_migration
-    
-    log "迁移实例专用服务器优化完成"
-}
-
-# 迁移后数据库优化
-optimize_database_after_migration() {
-    log "执行数据库优化..."
-    
-    # 等待数据库完全启动
-    local db_ready=false
-    for i in {1..30}; do
-        if docker compose exec -T db pg_isready -U odoo -d postgres >/dev/null 2>&1; then
-            db_ready=true
-            break
-        fi
-        sleep 2
-    done
-    
-    if [ "$db_ready" = true ]; then
-        # 执行数据库维护
-        log "执行数据库维护操作..."
-        docker compose exec -T db psql -U odoo -d postgres -c "VACUUM ANALYZE;" >/dev/null 2>&1 || true
-        docker compose exec -T db psql -U odoo -d postgres -c "REINDEX DATABASE postgres;" >/dev/null 2>&1 || true
-        log "数据库优化完成"
-    else
-        log_warn "数据库未能及时启动，跳过数据库优化"
-    fi
-}
-
 # 确认操作
 confirm_action() {
     local message="$1"
@@ -1940,42 +1442,6 @@ backup_existing_data() {
         docker exec "$DETECTED_DB_CONTAINER" pg_dumpall -U postgres | gzip > "$backup_path/database.sql.gz" 2>/dev/null || \
         docker exec "$DETECTED_DB_CONTAINER" pg_dumpall -U odoo | gzip > "$backup_path/database.sql.gz" 2>/dev/null || \
         log_warn "数据库备份失败"
-    fi
-}
-
-# 获取部署信息
-get_deployment_info() {
-    local -n deployment_type_ref=$1
-    local -n domain_ref=$2
-    local -n use_www_ref=$3
-    
-    deployment_type_ref="local"
-    domain_ref=""
-    use_www_ref="no"
-    
-    if [ -n "$DETECTED_DOMAIN" ]; then
-        echo "检测到现有域名: $DETECTED_DOMAIN"
-        read -p "是否使用此域名？(Y/n): " use_domain
-        if [[ ! "$use_domain" =~ ^[Nn]$ ]]; then
-            deployment_type_ref="domain"
-            domain_ref="$DETECTED_DOMAIN"
-            
-            # 自动检测是否带www
-            if [[ "$domain_ref" == www.* ]]; then
-                use_www_ref="yes"
-            fi
-            # 原手动选择已替换为自动检测
-        fi
-    fi
-    
-    # 如果没有域名，询问是否使用域名模式
-    if [ -z "$domain_ref" ]; then
-        read -p "是否使用域名模式？(y/N): " use_domain
-        if [[ "$use_domain" =~ ^[Yy]$ ]]; then
-            deployment_type_ref="domain"
-            read -p "请输入域名: " domain_ref
-            [ -z "$domain_ref" ] && deployment_type_ref="local"
-        fi
     fi
 }
 
@@ -2008,9 +1474,32 @@ create_new_instance() {
     # 启动服务并等待就绪
     start_services
     
-    # 如果是域名模式，配置SSL和Nginx
+    # 域名模式：先让 HTTP 配置生效，签下证书，再切到 HTTPS 配置
+    #
+    # 顺序是有代价换来的（另一半说明在 generate_docker_compose 里）：上一步只写了
+    # HTTP 配置，这里必须先 reload 让它真的生效 —— certbot --webroot 要靠一个
+    # **正在运行的** nginx 把 /.well-known/acme-challenge/ 下的挑战文件送出去。
+    #
+    # 原来的代码在这里直接调 certbot，而此刻 nginx 还跑着 Ubuntu 的 default 站点
+    # （挑战路径 404，因为刚写的配置还没 reload）。于是签证书必然失败，静默回落成
+    # HTTP，最后却打印一句 "访问地址: https://…" —— 域名模式从来没真正拿到过 HTTPS。
     if [ "$deployment_type" = "domain" ]; then
-        get_ssl_certificate "$domain" "$use_www"
+        log "启用 HTTP 配置以便完成 ACME 域名验证..."
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx
+
+        if get_ssl_certificate "$domain" "$use_www"; then
+            log "证书就绪，切换到 HTTPS 配置..."
+            create_nginx_domain_config "$domain" "$use_www"
+            if nginx -t 2>/dev/null; then
+                systemctl reload nginx
+            else
+                # 走到这里说明证书签出来了但 HTTPS 配置有问题。保住可用的 HTTP，
+                # 不要留下一个 nginx 加载不了的配置把站点整个弄掉。
+                log_error "HTTPS 配置检查未通过，回退到 HTTP 配置"
+                create_nginx_http_config "$domain" "$use_www"
+                systemctl reload nginx 2>/dev/null || true
+            fi
+        fi
     fi
     
     log "新实例创建完成"
@@ -2136,13 +1625,22 @@ restore_from_backup() {
     
     # 询问域名
     local deployment_type domain use_www
-    get_restore_deployment_info "$deployment_type" "$domain" "$use_www"
+    # 同上：nameref 要传变量名而不是值（见 deploy_new_instance 里的说明）。
+    get_restore_deployment_info deployment_type domain use_www
     
     # 解压备份
     local temp_dir="/tmp/restore_$(date '+%Y%m%d%H%M%S')"
     mkdir -p "$temp_dir"
     
     log "解压备份文件: $(basename "$backup_file")"
+    if [ ! -f "$backup_file" ]; then
+        # 这一条是上面那个 stdout 污染 bug 留下的教训：当时 $backup_file 里混进了
+        # 整段菜单文本，tar 的报错是一大团转义字符，看不出真正的原因。先检查文件
+        # 存在，报一句人能看懂的话。
+        log_error "备份文件不存在或路径异常: $backup_file"
+        rm -rf "$temp_dir"
+        return 1
+    fi
     if ! tar -xzf "$backup_file" -C "$temp_dir"; then
         log_error "备份文件解压失败"
         rm -rf "$temp_dir"
@@ -2216,7 +1714,7 @@ restore_additional_configs() {
         log "发现备份的环境变量配置"
         
         # 提取备份中的管理员密码
-        local backup_admin_pass=$(grep "^ADMIN_PASSWORD=" "$backup_env" | cut -d'=' -f2)
+        local backup_admin_pass=$(grep "^ADMIN_PASSWORD=" "$backup_env" | cut -d'=' -f2-)
         if [ -n "$backup_admin_pass" ]; then
             log "恢复管理员密码..."
             sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$backup_admin_pass/" "$INSTANCE_DIR/.env"
@@ -2241,48 +1739,69 @@ show_restore_summary() {
     echo "实例目录: $INSTANCE_DIR"
     echo "恢复时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
+    # 这几条建议要跟着菜单一起改。v7.0 删掉了「系统状态检查」和「修改配置」两项，
+    # 而这里还在让人去选它们 —— 指着不存在的入口，比不给建议更让人困惑。
     echo "后续操作建议:"
-    echo "1. 检查系统状态: 在脚本菜单中选择'系统状态检查'"
-    echo "2. 修改密码: 建议修改管理员密码"
-    echo "3. 检查配置: 确认Odoo配置是否符合当前环境"
-    echo "4. 创建备份: 恢复完成后建议立即创建新备份"
+    echo "1. 检查实例状态: 重新运行本脚本 -> 管理实例 -> 查看实例状态"
+    echo "2. 修改管理员密码: 登录 Odoo 后在「设置 -> 用户」里改"
+    echo "3. 核对访问是否正常，再确认数据是否完整"
+    echo "4. 立即做一次新备份: sudo $0 backup"
     echo ""
 }
 
 # 选择备份文件
+#
+# 这个函数用 stdout 返回选中的文件路径，所以**给人看的东西一律走 stderr**。
+#
+# 原来菜单是 `echo` 到 stdout 的，而调用方是
+# `local backup_file=$(select_backup_file "${backup_files[@]}")` —— 于是整段菜单文本
+# 连同 log 行都被当成了返回值。实测现象：
+#
+#   解压备份文件: backup_20260911_045159.tar.gz
+#   tar (child): \n发现备份文件\:\n====================\n1) backup_...\n…: Cannot open
+#
+# 也就是说**恢复功能整个不可用** —— 而客户用到恢复的时候，通常已经出事了。
 select_backup_file() {
     local backup_files=("$@")
-    
-    echo ""
-    echo "发现备份文件:"
-    echo "===================="
-    
-    for i in "${!backup_files[@]}"; do
-        local file="${backup_files[$i]}"
-        local size=$(du -h "$file" 2>/dev/null | cut -f1)
-        local date=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1)
-        
-        # 检查是否在脚本目录
-        local location="默认备份目录"
-        if [[ "$file" == "$SCRIPT_DIR"* ]]; then
-            location="脚本目录"
-        fi
-        
-        echo "$((i+1))) $(basename "$file")"
-        echo "    大小: $size | 日期: $date | 位置: $location"
+
+    {
         echo ""
-    done
-    
+        echo "发现备份文件:"
+        echo "===================="
+
+        for i in "${!backup_files[@]}"; do
+            local file="${backup_files[$i]}"
+            local size=$(du -h "$file" 2>/dev/null | cut -f1)
+            local date=$(stat -c %y "$file" 2>/dev/null | cut -d' ' -f1)
+
+            # 检查是否在脚本目录
+            local location="默认备份目录"
+            if [[ "$file" == "$SCRIPT_DIR"* ]]; then
+                location="脚本目录"
+            fi
+
+            echo "$((i+1))) $(basename "$file")"
+            echo "    大小: $size | 日期: $date | 位置: $location"
+            echo ""
+        done
+    } >&2
+
+    # read -p 的提示本来就走 stderr，不用额外重定向。
     read -p "选择要恢复的备份文件 (1-${#backup_files[@]}) [默认: 1]: " choice
     choice=${choice:-1}
-    
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#backup_files[@]} ]; then
-        log_error "无效选择"
-        return
+
+    # 用 case 而不是 `[ "$choice" -lt 1 ]`：输入非数字时 -lt 会报
+    # "integer expression expected"，而脚本开头是 set -e。
+    case "$choice" in
+        ''|*[!0-9]*) log_error "无效选择: $choice" >&2; return 1 ;;
+    esac
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#backup_files[@]}" ]; then
+        log_error "无效选择: $choice" >&2
+        return 1
     fi
-    
+
     local backup_file="${backup_files[$((choice-1))]}"
-    log "选择恢复: $(basename "$backup_file")"
+    log "选择恢复: $(basename "$backup_file")" >&2
     echo "$backup_file"
 }
 
@@ -2345,9 +1864,16 @@ restore_from_backup_file() {
 deploy_new_instance() {
     log "全新部署茂亨Odoo..."
     
-    # 询问域名
+    # 询问部署模式与域名
+    #
+    # 传**变量名**，不能传值。get_deployment_info_interactive 用 `local -n x=$1`
+    # 声明 nameref，nameref 要的是名字；写成 "$deployment_type" 传过去的是空值，
+    # bash 报 `local: '': not a valid identifier`，而这句错误不会中止脚本
+    # （set -e 对函数内 local 失败不生效），于是三个变量全是空的 —— 客户选了
+    # 「公网域名模式」也会被静默部署成内网 IP 模式：没有 SSL、nginx 用的是 local
+    # 站点配置，最后还打印一句域名为空的 "访问地址: https://"。
     local deployment_type domain use_www
-    get_deployment_info_interactive "$deployment_type" "$domain" "$use_www"
+    get_deployment_info_interactive deployment_type domain use_www
     
     # 初始化环境（如果需要）
     check_and_init_environment
@@ -2356,12 +1882,23 @@ deploy_new_instance() {
     create_new_instance "$deployment_type" "$domain" "$use_www"
     
     # 重启Nginx
-    systemctl reload nginx
+    # reload 失败不该让整个部署脚本因为 set -e 直接退出。
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
     
     log "部署完成！"
     
     if [ "$deployment_type" = "domain" ]; then
-        log "访问地址: https://$domain"
+        # 按**实际有没有证书**报地址，不按客户当初选了什么。
+        #
+        # 原来这里无条件打印 https://，而证书没签成时站点只有 80 端口在听 ——
+        # 客户照着提示访问 https 打不开，看起来像整个部署都失败了。
+        if [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
+            log "访问地址: https://$domain"
+        else
+            log_warn "SSL 证书未签发成功，当前仅 HTTP 可用"
+            log "访问地址: http://$domain"
+            log "解决域名解析或 80 端口可达性之后，重跑一次部署即可切到 HTTPS"
+        fi
     else
         local server_ip=$(get_server_ip)
         log "访问地址: http://$server_ip"
@@ -2432,26 +1969,25 @@ manage_script_instance() {
     local choice
     while true; do
         show_management_menu
-        read -p "请选择操作 (1-9): " choice
-        
+        read -p "请选择操作 (1-6): " choice
+
         case $choice in
             1) show_instance_status ;;
             2) restart_instance ;;
             3) show_logs ;;
             4) backup_instance ;;
-            5) modify_config ;;
-            6) check_system_status ;;
-            7) optimize_existing_instance ;;
-            8) upgrade_instance ;;
-            9) return 1 ;;  # 返回主菜单
+            5) upgrade_instance ;;
+            6) return 1 ;;  # 返回主菜单
             *) log_error "无效选择" ;;
         esac
-        
-        [ "$choice" -eq 9 ] && break
+
+        # 用字符串比较而不是 -eq：输入非数字时 `[ abc -eq 6 ]` 会报错，
+        # 而脚本开头是 set -e，于是一次手滑就把整个脚本带退出。
+        [ "$choice" = "6" ] && break
         echo ""
         read -p "按回车键继续..."
     done
-    
+
     return 0
 }
 
@@ -2465,11 +2001,8 @@ show_management_menu() {
     echo "2) 重启实例"
     echo "3) 查看日志"
     echo "4) 备份实例"
-    echo "5) 修改配置"
-    echo "6) 系统状态检查"
-    echo "7) 性能优化"
-    echo "8) 升级（拉取新镜像并应用更新）"
-    echo "9) 返回主菜单"
+    echo "5) 升级（拉取新镜像并应用更新）"
+    echo "6) 返回主菜单"
     echo ""
 }
 
@@ -2505,6 +2038,13 @@ upgrade_instance() {
     cd "$INSTANCE_DIR" || { log_error "无法进入实例目录"; return 1; }
 
     # 2. 仅拉取 Odoo 镜像（数据库镜像保持不变，避免 PG 大版本变化撞坏数据）
+    # 2. 仅拉取 Odoo 镜像（数据库镜像保持不变，避免 PG 大版本变化撞坏数据）
+    #
+    # 记下拉取前后的镜像 ID：一样就说明本地已是最新，容器不会被重建。原来无论如何都
+    # 打印"重建 Odoo 容器…"，而 compose 实际输出的是 "Container morhon-odoo Running"
+    # （没动），两句话对不上，客户以为升级做了而其实什么都没发生。
+    local img_before img_after
+    img_before=$(docker image inspect -f '{{.Id}}' "$ODOO_IMAGE" 2>/dev/null || echo none)
     log "拉取最新 Odoo 镜像..."
     if ! docker compose pull odoo; then
         log_error "镜像拉取失败，已中止升级（实例未改动）"
@@ -2513,21 +2053,47 @@ upgrade_instance() {
 
     # 3. 仅重建 Odoo 容器（不动数据库）。镜像 entrypoint 会在镜像版本变化时
     #    以单进程方式自动执行模块升级，普通重启则秒级启动。
-    log "重建 Odoo 容器并应用更新（容器内自动单进程升级，可能需几分钟）..."
+    img_after=$(docker image inspect -f '{{.Id}}' "$ODOO_IMAGE" 2>/dev/null || echo none)
+    if [ "$img_before" = "$img_after" ]; then
+        log "镜像与本地一致，已是最新版本 —— 容器无需重建"
+    else
+        log "镜像已更新，重建 Odoo 容器并应用更新（容器内自动单进程升级，可能需几分钟）..."
+    fi
     if ! docker compose up -d --no-deps odoo; then
         log_error "Odoo 容器重建失败，请检查：cd $INSTANCE_DIR && docker compose logs odoo"
         return 1
     fi
 
     # 4. 等待服务就绪（首次升级需跑完单进程 -u all，耗时较长）
-    log "等待 Odoo 启动就绪（最多约 5 分钟）..."
+    # 等待服务就绪：看**容器健康状态**，不看日志横幅
+    #
+    # 原来是 `docker compose logs --tail 100 odoo | grep "HTTP service (werkzeug) running"`。
+    # 那个横幅只在启动时打一次，容器跑了一阵之后早就不在最后 100 行里了 —— 于是当
+    # 镜像已是最新、容器**没有**被重建时，这个判断永远匹配不到，白等 5 分钟然后报一句
+    # "等待超时"，而实例其实一直是健康的。实测复现（容器已运行 25 分钟）。
+    #
+    # 健康状态是更准的信号：镜像的 entrypoint 会先跑完单进程模块升级、再启动 HTTP，
+    # 而 healthcheck 探的是 HTTP —— 所以 healthy 就意味着升级已经做完了。
+    log "等待 Odoo 就绪（最多约 5 分钟）..."
     local ready=false
-    local i
+    local cid health i
+    cid=$(docker compose ps -q odoo 2>/dev/null | head -1)
     for i in $(seq 1 60); do
-        if docker compose logs --tail 100 odoo 2>/dev/null | grep -q "HTTP service (werkzeug) running"; then
-            ready=true
-            break
+        if [ -z "$cid" ]; then
+            cid=$(docker compose ps -q odoo 2>/dev/null | head -1)
         fi
+        health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealthcheck{{end}}' \
+                 "$cid" 2>/dev/null || echo unknown)
+        case "$health" in
+            healthy)
+                ready=true; break ;;
+            nohealthcheck)
+                # 镜像没定义 healthcheck 时才退回看日志，并且**不加 --tail**，
+                # 否则又会因为横幅滚出窗口而误判。
+                if docker compose logs odoo 2>/dev/null | grep -q "HTTP service (werkzeug) running"; then
+                    ready=true; break
+                fi ;;
+        esac
         sleep 5
     done
 
@@ -2542,210 +2108,6 @@ upgrade_instance() {
     echo ""
     docker compose ps
     return 0
-}
-
-# 系统状态检查 - 专用服务器监控
-check_system_status() {
-    echo ""
-    echo -e "${CYAN}茂亨Odoo专用服务器状态检查${NC}"
-    echo "================================================"
-    
-    # 检查Docker状态
-    echo -e "\n${YELLOW}Docker状态:${NC}"
-    if systemctl is-active --quiet docker; then
-        echo "✓ Docker服务运行正常"
-        local docker_version=$(docker --version | cut -d' ' -f3 | cut -d',' -f1)
-        echo "  版本: $docker_version"
-    else
-        echo "✗ Docker服务未运行"
-    fi
-    
-    # 检查Nginx状态
-    echo -e "\n${YELLOW}Nginx状态:${NC}"
-    if systemctl is-active --quiet nginx; then
-        echo "✓ Nginx服务运行正常"
-        local nginx_version=$(nginx -v 2>&1 | cut -d'/' -f2)
-        echo "  版本: $nginx_version"
-        
-        # 检查Nginx配置
-        if nginx -t >/dev/null 2>&1; then
-            echo "✓ Nginx配置语法正确"
-        else
-            echo "✗ Nginx配置存在错误"
-        fi
-    else
-        echo "✗ Nginx服务未运行"
-    fi
-    
-    # 检查容器状态
-    echo -e "\n${YELLOW}容器状态:${NC}"
-    if [ -f "$INSTANCE_DIR/docker-compose.yml" ]; then
-        cd "$INSTANCE_DIR"
-        docker compose ps
-        
-        # 检查容器资源使用
-        echo -e "\n${YELLOW}容器资源使用:${NC}"
-        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" morhon-odoo morhon-odoo-db 2>/dev/null || echo "无法获取容器统计信息"
-    else
-        echo "未找到Docker Compose配置文件"
-    fi
-    
-    # 检查端口状态
-    echo -e "\n${YELLOW}端口状态:${NC}"
-    local ports=("80:HTTP" "443:HTTPS" "8069:Odoo" "8072:Longpolling")
-    for port_info in "${ports[@]}"; do
-        local port=$(echo "$port_info" | cut -d':' -f1)
-        local service=$(echo "$port_info" | cut -d':' -f2)
-        if netstat -tlnp | grep -q ":$port "; then
-            echo "✓ 端口$port ($service) 已监听"
-        else
-            echo "✗ 端口$port ($service) 未监听"
-        fi
-    done
-    
-    # 系统资源监控
-    echo -e "\n${YELLOW}系统资源:${NC}"
-    
-    # CPU信息
-    local cpu_cores=$(nproc)
-    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    echo "CPU: ${cpu_cores}核心, 使用率: ${cpu_usage}%"
-    
-    # 内存使用
-    local mem_info=$(free -h | grep "Mem:")
-    local mem_total=$(echo "$mem_info" | awk '{print $2}')
-    local mem_used=$(echo "$mem_info" | awk '{print $3}')
-    local mem_percent=$(free | grep "Mem:" | awk '{printf "%.1f", $3/$2 * 100.0}')
-    echo "内存: ${mem_used}/${mem_total} (${mem_percent}% 已使用)"
-    
-    # 磁盘空间
-    echo -e "\n${YELLOW}磁盘空间:${NC}"
-    df -h / | tail -1 | awk '{print "根分区: " $3 "/" $2 " (" $5 " 已使用)"}'
-    
-    # Docker卷空间
-    if command -v docker &> /dev/null; then
-        local docker_space=$(docker system df --format "table {{.Type}}\t{{.TotalCount}}\t{{.Size}}" 2>/dev/null | grep -E "Images|Containers|Local Volumes" || echo "无法获取Docker空间信息")
-        echo -e "\n${YELLOW}Docker存储:${NC}"
-        echo "$docker_space"
-    fi
-    
-    # 网络连接统计
-    echo -e "\n${YELLOW}网络连接:${NC}"
-    local connections=$(netstat -an | grep -E ":80|:443|:8069|:8072" | wc -l)
-    echo "活跃连接数: $connections"
-    
-    # 负载平均值
-    local load_avg=$(uptime | awk -F'load average:' '{print $2}')
-    echo "系统负载:$load_avg"
-    
-    # 检查SSL证书（如果是域名模式）
-    if [ -f "$INSTANCE_DIR/.env" ]; then
-        local domain=$(grep "^DOMAIN=" "$INSTANCE_DIR/.env" | cut -d'=' -f2)
-        if [ -n "$domain" ] && [ "$domain" != "" ]; then
-            echo -e "\n${YELLOW}SSL证书状态:${NC}"
-            if [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
-                local cert_expiry=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$domain/fullchain.pem" | cut -d= -f2)
-                local days_left=$(( ($(date -d "$cert_expiry" +%s) - $(date +%s)) / 86400 ))
-                echo "✓ SSL证书存在，到期时间: $cert_expiry"
-                if [ "$days_left" -lt 30 ]; then
-                    echo "⚠ 警告: SSL证书将在 $days_left 天后过期"
-                else
-                    echo "✓ SSL证书有效期充足 ($days_left 天)"
-                fi
-            else
-                echo "✗ SSL证书不存在"
-            fi
-        fi
-    fi
-    
-    # 系统优化状态检查
-    echo -e "\n${YELLOW}系统优化状态:${NC}"
-    
-    # 检查内核参数优化
-    if [ -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
-        echo "✓ 内核参数已优化"
-    else
-        echo "✗ 内核参数未优化"
-    fi
-    
-    # 检查系统限制优化
-    if [ -f "/etc/security/limits.d/99-morhon-odoo.conf" ]; then
-        echo "✓ 系统限制已优化"
-    else
-        echo "✗ 系统限制未优化"
-    fi
-    
-    # 检查Docker优化
-    if [ -f "/etc/docker/daemon.json" ]; then
-        echo "✓ Docker配置已优化"
-    else
-        echo "✗ Docker配置未优化"
-    fi
-    
-    # 外贸系统安全检查
-    echo -e "\n${YELLOW}外贸系统安全状态:${NC}"
-    
-    # 检查防火墙状态
-    if ufw status | grep -q "Status: active"; then
-        echo "✓ 防火墙已启用"
-        local blocked_ports=$(ufw status | grep -c "DENY")
-        echo "  已阻止 $blocked_ports 个危险端口"
-    else
-        echo "✗ 防火墙未启用"
-    fi
-    
-    # 检查fail2ban状态
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        echo "✓ fail2ban入侵防护已启用"
-        local banned_ips=$(fail2ban-client status 2>/dev/null | grep -o "Jail list:.*" | wc -w)
-        [ "$banned_ips" -gt 2 ] && echo "  监控 $((banned_ips - 2)) 个服务"
-    else
-        echo "⚠ fail2ban未安装或未启用"
-    fi
-    
-    # 检查数据库安全
-    if docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT version();" >/dev/null 2>&1; then
-        echo "✓ 数据库连接安全"
-        local db_connections=$(docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | grep -E "^\s*[0-9]+\s*$" | tr -d ' ')
-        [ -n "$db_connections" ] && echo "  当前连接数: $db_connections"
-    else
-        echo "✗ 数据库连接异常"
-    fi
-    
-    # 外贸系统性能建议
-    echo -e "\n${YELLOW}外贸系统性能建议:${NC}"
-    
-    # CPU使用率建议
-    if (( $(echo "$cpu_usage > 80" | bc -l) )); then
-        echo "⚠ CPU使用率较高，建议检查Odoo worker配置或升级CPU"
-    fi
-    
-    # 内存使用建议
-    if (( $(echo "$mem_percent > 85" | bc -l) )); then
-        echo "⚠ 内存使用率较高，建议优化Odoo内存配置或增加内存"
-    fi
-    
-    # 磁盘空间建议
-    local disk_usage=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
-    if [ "$disk_usage" -gt 85 ]; then
-        echo "⚠ 磁盘空间不足，建议清理日志和备份文件"
-    fi
-    
-    # 外贸业务专用建议
-    local current_hour=$(date +%H)
-    if [ "$current_hour" -ge 9 ] && [ "$current_hour" -le 18 ]; then
-        echo "💡 当前为工作时间，建议避免进行系统维护操作"
-    fi
-    
-    # 数据库连接建议
-    if docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" >/dev/null 2>&1; then
-        local db_connections=$(docker exec morhon-odoo-db psql -U odoo -d postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | grep -E "^\s*[0-9]+\s*$" | tr -d ' ')
-        if [ -n "$db_connections" ] && [ "$db_connections" -gt 150 ]; then
-            echo "⚠ 数据库连接数较多($db_connections)，建议检查连接池配置"
-        fi
-    fi
-    
-    echo ""
 }
 
 # 显示实例状态
@@ -2820,7 +2182,7 @@ backup_instance() {
 备份信息
 ========
 备份时间: $(date '+%Y-%m-%d %H:%M:%S')
-脚本版本: 6.4
+脚本版本: $SCRIPT_VERSION
 实例目录: $INSTANCE_DIR
 备份类型: 完整备份
 
@@ -2849,164 +2211,14 @@ EOF
     fi
 }
 
-# 修改配置
-modify_config() {
-    echo ""
-    echo "1) 修改管理员密码"
-    echo "2) 修改数据库密码"
-    echo "3) 修改Nginx配置"
-    read -p "选择操作 (1-3): " config_choice
-    
-    case $config_choice in
-        1) update_admin_password ;;
-        2) update_db_password ;;
-        3) update_nginx_config ;;
-        *) log_error "无效选择" ;;
-    esac
-}
-
-# 更新管理员密码
-update_admin_password() {
-    read -p "输入新管理员密码: " new_pass
-    sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
-    cd "$INSTANCE_DIR" && docker compose restart odoo
-    log "管理员密码已更新"
-}
-
-# 更新数据库密码
-update_db_password() {
-    read -p "输入新数据库密码: " new_pass
-    sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$new_pass/" "$INSTANCE_DIR/.env"
-    cd "$INSTANCE_DIR" && docker compose restart
-    log "数据库密码已更新"
-}
-
-# 更新Nginx配置
-update_nginx_config() {
-    nano /etc/nginx/sites-available/morhon-odoo
-    nginx -t && systemctl reload nginx
-    log "Nginx配置已更新"
-}
-
-# 优化现有实例
-optimize_existing_instance() {
-    echo ""
-    echo -e "${CYAN}茂亨Odoo专用服务器优化${NC}"
-    echo "================================"
-    echo ""
-    echo "此操作将对现有实例进行全面优化："
-    echo "• 系统内核参数优化"
-    echo "• Docker配置优化"
-    echo "• Nginx配置优化"
-    echo "• Odoo配置优化"
-    echo "• 数据库性能优化"
-    echo ""
-    
-    if ! confirm_action "确认执行专用服务器优化？这将重启相关服务"; then
-        log "取消优化操作"
-        return 1
-    fi
-    
-    log "开始优化现有实例..."
-    
-    # 1. 系统优化
-    if [ ! -f "/etc/sysctl.d/99-morhon-odoo.conf" ]; then
-        log "执行系统优化..."
-        optimize_system_for_odoo
-    else
-        log "系统优化已存在，跳过"
-    fi
-    
-    # 2. 重新生成优化配置
-    log "重新生成优化配置..."
-    local cpu_cores=$(nproc)
-    local total_mem=$(free -g | awk '/^Mem:/{print $2}')
-    local workers=$(calculate_workers "$cpu_cores" "$total_mem")
-    
-    # 备份现有配置
-    local backup_suffix=$(date '+%Y%m%d_%H%M%S')
-    cp "$INSTANCE_DIR/config/odoo.conf" "$INSTANCE_DIR/config/odoo.conf.backup.$backup_suffix" 2>/dev/null || true
-    cp "$INSTANCE_DIR/docker-compose.yml" "$INSTANCE_DIR/docker-compose.yml.backup.$backup_suffix" 2>/dev/null || true
-    
-    # 生成新的优化配置
-    create_odoo_config "$workers" "$total_mem"
-    create_docker_compose_config
-    
-    # 3. 优化Nginx配置
-    log "优化Nginx配置..."
-    configure_nginx
-    
-    # 检查当前部署类型
-    local deployment_type="local"
-    local domain=""
-    local use_www="no"
-    
-    if [ -f "$INSTANCE_DIR/.env" ]; then
-        domain=$(grep "^DOMAIN=" "$INSTANCE_DIR/.env" | cut -d'=' -f2 2>/dev/null || echo "")
-        if [ -n "$domain" ] && [ "$domain" != "" ]; then
-            deployment_type="domain"
-            if [[ "$domain" == www.* ]]; then
-                use_www="yes"
-            fi
-        fi
-    fi
-    
-    # 重新生成Nginx站点配置
-    if [ "$deployment_type" = "domain" ]; then
-        create_nginx_domain_config "$domain" "$use_www"
-    else
-        create_nginx_local_config
-    fi
-    
-    # 4. 重启服务应用优化
-    log "重启服务应用优化配置..."
-    cd "$INSTANCE_DIR"
-    
-    # 停止服务
-    docker compose down
-    
-    # 重启Docker服务以应用新配置
-    systemctl restart docker
-    sleep 5
-    
-    # 启动优化后的服务
-    docker compose up -d
-    
-    # 重启Nginx
-    systemctl restart nginx
-    
-    # 5. 等待服务启动并进行数据库优化
-    log "等待服务启动..."
-    sleep 15
-    
-    # 数据库优化
-    optimize_database_after_migration
-    
-    # 6. 显示优化结果
-    echo ""
-    echo -e "${GREEN}优化完成！${NC}"
-    echo "===================="
-    echo "优化内容："
-    echo "• CPU核心数: $cpu_cores"
-    echo "• 内存总量: ${total_mem}GB"
-    echo "• Odoo Workers: $workers"
-    echo "• 部署模式: $deployment_type"
-    [ -n "$domain" ] && echo "• 域名: $domain"
-    echo ""
-    echo "配置备份："
-    echo "• Odoo配置: $INSTANCE_DIR/config/odoo.conf.backup.$backup_suffix"
-    echo "• Docker配置: $INSTANCE_DIR/docker-compose.yml.backup.$backup_suffix"
-    echo ""
-    echo "建议执行系统状态检查验证优化效果"
-    
-    return 0
-}
-
 # 显示主菜单
 show_main_menu() {
-    clear
+    # 清屏失败不该中止部署。没有 TTY（或 TERM=unknown）时 `clear` 返回非零，
+    # 而脚本开头是 set -e —— 于是在 CI、nohup、`ssh 主机 "命令"` 这类没有终端的
+    # 场景下，脚本会在显示菜单之前就静默退出。实测踩到过。
+    clear 2>/dev/null || true
     echo -e "${PURPLE}================================${NC}"
-    echo -e "${PURPLE}   茂亨Odoo管理脚本 v6.4${NC}"
+    echo -e "${PURPLE}   茂亨Odoo部署脚本 v${SCRIPT_VERSION}${NC}"
     echo -e "${PURPLE}================================${NC}"
     echo ""
     
@@ -3053,16 +2265,17 @@ show_manual_instance_menu() {
     [ -n "$DETECTED_DB_CONTAINER" ] && echo "数据库容器: $DETECTED_DB_CONTAINER"
     [ -n "$DETECTED_DOMAIN" ] && echo "域名: $DETECTED_DOMAIN"
     echo ""
-    echo "1) 迁移到脚本管理"
-    echo "2) 查看容器信息"
-    echo "3) 退出"
+    echo "这台机器上的实例不是本脚本部署的，脚本不接管它 —— 只能看信息。"
+    echo "要交给脚本管理，请先备份数据，再用「全新部署」重建。"
     echo ""
-    read -p "请选择 (1-3): " choice
-    
+    echo "1) 查看容器信息"
+    echo "2) 退出"
+    echo ""
+    read -p "请选择 (1-2): " choice
+
     case $choice in
-        1) migrate_manual_instance ;;
-        2) show_container_info ;;
-        3) exit 0 ;;
+        1) show_container_info ;;
+        2) exit 0 ;;
         *) log_error "无效选择" ;;
     esac
 }
@@ -3113,6 +2326,9 @@ if [ $# -ge 1 ]; then
     case "$1" in
         "init")
             check_sudo
+            # 交互式入口会先查系统，这个子命令以前直接跳过了 —— 于是在非 Ubuntu 上
+            # 会一路 apt-get 到失败才报错。先查再装。
+            check_system_compatibility
             init_environment
             exit 0
             ;;
@@ -3130,7 +2346,7 @@ if [ $# -ge 1 ]; then
             check_sudo
             detect_environment
             if [ "$DETECTED_INSTANCE_TYPE" = "script" ]; then
-                check_system_status
+                show_instance_status
             elif [ "$DETECTED_INSTANCE_TYPE" = "manual" ]; then
                 echo "检测到手动部署实例:"
                 show_container_info
@@ -3156,14 +2372,14 @@ if [ $# -ge 1 ]; then
             exit 0
             ;;
         "help"|"--help"|"-h")
-            echo "茂亨Odoo管理脚本 v6.4"
-            echo "专为外贸企业设计的Odoo部署和管理工具"
+            echo "茂亨Odoo部署脚本 v${SCRIPT_VERSION}"
+            echo "专为外贸企业设计的Odoo部署工具"
             echo ""
             echo "用法: $0 [命令]"
             echo ""
             echo "命令:"
             echo "  (无参数)   启动交互式菜单"
-            echo "  init       初始化环境（安装Docker、Nginx等依赖）"
+            echo "  init       安装部署依赖（Docker、Nginx、certbot）"
             echo "  backup     备份脚本管理的实例"
             echo "  restore    从备份恢复（自动检测同目录备份文件）"
             echo "  upgrade    升级到最新镜像（拉取新镜像并应用更新，仅脚本实例）"
@@ -3191,15 +2407,12 @@ if [ $# -ge 1 ]; then
             echo "  • 支持内网生产环境和公网生产环境部署"
             echo "  • 自动SSL证书获取和续期（公网模式）"
             echo "  • 完整的备份和恢复功能"
-            echo "  • 手动实例迁移到脚本管理"
-            echo "  • 外贸业务性能优化和安全加固"
-            echo "  • 健康检查和状态监控"
-            echo "  • Docker卷映射，防止插件冲突"
+                                    echo "  • Docker卷映射，防止插件冲突"
             echo ""
             echo "运行逻辑:"
             echo "  1. 检测现有实例类型"
             echo "  2. 脚本实例 → 管理菜单（状态、备份、配置等）"
-            echo "  3. 手动实例 → 迁移菜单（迁移到脚本管理）"
+            echo "  3. 手动实例 → 只显示容器信息（脚本不接管非自己部署的实例）"
             echo "  4. 无实例 → 全新部署菜单（选择内网或公网模式）"
             echo ""
             echo "重要说明:"

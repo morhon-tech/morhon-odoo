@@ -18,7 +18,7 @@
 
 ## 茂亨Odoo介绍
 
-茂亨Odoo是基于开源Odoo针对外贸企业深度定制的完整管理系统，包含进销存、财务、客户管理等全部企业管理模块和网站功能。本部署脚本专注于企业管理功能的性能优化和安全加固，**推荐用于企业内部管理，不推荐使用网站功能**。
+茂亨Odoo是基于开源Odoo针对外贸企业深度定制的完整管理系统，包含进销存、财务、客户管理等全部企业管理模块和网站功能。本部署脚本只负责把这套系统部署起来并长期运行，不接管服务器的运维与加固，**推荐用于企业内部管理，不推荐使用网站功能**。
 
 ### 🎯 **推荐部署方式**
 
@@ -69,13 +69,60 @@
 - ✅ **推荐部署**: 本地模式和二级域名模式，专注企业管理
 - ✅ **智能域名**: 自动处理域名配置，支持二级域名部署
 - ✅ **SSL自动化**: 自动获取和续期Let's Encrypt证书
-- ✅ **完整备份**: 数据库、配置文件、环境变量、Redis缓存一键备份
+- ✅ **完整备份**: 数据库、配置文件、环境变量一键备份
 - ✅ **跨服务器迁移**: 备份文件可直接在新服务器恢复
-- ✅ **实例迁移**: 手动部署实例迁移到脚本管理
-- ✅ **数据保护**: Docker卷映射，防止误操作和插件冲突，Redis缓存持久化
-- ✅ **性能优化**: 专注企业管理功能，Redis缓存加速，根据服务器配置自动优化
-- ✅ **Redis缓存加速**: 双层缓存架构，页面响应速度提升60%
-- ✅ **健康监控**: 容器健康检查、系统状态监控、Redis性能监控
+- ✅ **数据保护**: Docker卷映射，防止误操作和插件冲突
+- ✅ **不动全局配置**: 只加 Nginx 站点配置，不改内核参数、防火墙、SSH、nginx.conf
+- ✅ **容器健康检查**: Odoo 与数据库容器均带 healthcheck，升级时据此判断就绪
+
+## 脚本做什么、不做什么
+
+v7.0 起，本脚本**只做部署，不接管你的服务器**。如果这台机器上还跑着别的服务，
+它不会被影响。
+
+**会做的**
+
+- 安装部署必需的包：Docker、Nginx、certbot、postgresql-client
+- 在 `/opt/morhon-odoo` 下生成 `docker-compose.yml`、`.env`、`config/odoo.conf`
+- 创建 Docker 卷、拉取镜像、启动容器
+- 加一份 Nginx 站点配置（`sites-available/morhon-odoo`）和一份 http 级片段
+  （`conf.d/morhon-odoo.conf`）—— **加，不是覆盖**
+- 域名模式下申请 Let's Encrypt 证书并配置自动续期
+- 备份、恢复、升级、查看状态
+
+**不会做的（v6.x 会做，v7.0 全部移除）**
+
+- ❌ 不改内核参数（`/etc/sysctl.d/`）和 ulimit（`/etc/security/limits.d/`）
+- ❌ 不写 `/etc/docker/daemon.json`
+- ❌ 不重置、不启用防火墙（完全不动 ufw）
+- ❌ 不修改 `/etc/ssh/sshd_config`，不重启 sshd
+- ❌ **不覆盖你的 `/etc/nginx/nginx.conf`**
+- ❌ 不禁用系统服务（snapd、apport、fwupd 等）
+- ❌ 不安装 fail2ban / rkhunter / chkrootkit / unattended-upgrades
+- ❌ 不写系统维护 cron（v6.x 有一条每周 `docker system prune -f --volumes`，
+  在容器停止期间可能删掉数据卷，已移除）
+- ❌ 不执行 `apt-get upgrade`（不替你升级整台机器的包）
+
+服务器的加固、调优和防火墙策略交回给你或你的运维，按整机情况统一决定。
+
+### 访问方式
+
+| 部署模式 | HTTP | HTTPS |
+|---|---|---|
+| 内网 IP 模式 | `http://<服务器IP>` —— 主入口，直接可用 | `https://<服务器IP>` —— 自签证书，浏览器会提示不受信任 |
+| 域名模式 | 自动 301 跳转到 HTTPS | `https://erp.company.com` —— Let's Encrypt，自动续期 |
+
+内网模式**刻意不把 80 跳转到 443**。内网拿不到公信证书（Let's Encrypt 不给 IP 地址
+签发，内网也没有域名可验证），只能自签；强制跳转会让每个人每次访问都先撞一次浏览器
+警告，等于把「输个 IP 就能用」这件事弄坏。需要加密的人自己走 https 即可。
+
+想在内网也用「不报警」的证书，两条路：用域名模式部署，或者把自己买的证书替换
+`/opt/morhon-odoo/ssl/` 下的 `fullchain.pem` 与 `privkey.pem`（然后
+`sudo systemctl reload nginx`）。
+
+**域名模式的证书续期**由 certbot 自带的定时器负责（每天两次检查）。续期成功后，
+`/etc/letsencrypt/renewal-hooks/deploy/10-reload-nginx.sh` 会自动 reload nginx，
+让新证书立即生效 —— 不需要任何人工操作。
 
 ## 快速开始
 
@@ -106,13 +153,6 @@ sudo apt update && sudo apt upgrade -y
 sudo do-release-upgrade
 ```
 
-**升级后优化**：
-```bash
-# 重新运行脚本以应用24.04专用优化
-sudo ./morhon-odoo.sh
-# 选择：管理实例 -> 性能优化
-```
-
 ### 1. 下载脚本
 
 ```bash
@@ -130,8 +170,9 @@ sudo ./morhon-odoo.sh
 
 脚本会自动检测环境并显示相应菜单：
 - **无实例**: 全新部署 或 从备份恢复
-- **手动实例**: 迁移到脚本管理
-- **脚本实例**: 管理现有实例
+- **脚本实例**: 管理现有实例（状态、重启、日志、备份、升级）
+- **手动部署的实例**: 只显示容器信息。脚本不接管不是它部署的实例 ——
+  要交给脚本管理，请先备份数据，再用「全新部署」重建
 
 **推荐部署方式**：
 - ✅ **本地部署**：直接回车，通过IP访问（最推荐）
@@ -140,39 +181,19 @@ sudo ./morhon-odoo.sh
 
 ### 4. 实例管理功能
 
-对于已部署的实例，脚本提供完整的管理功能：
+已部署的实例，脚本提供这些功能：
 
-- **查看实例状态** - 检查容器运行状态、资源使用情况、Redis缓存状态
-- **重启实例** - 安全重启Odoo、数据库和Redis服务
-- **查看日志** - 实时查看应用和系统日志
-- **备份实例** - 完整备份数据库、Redis缓存、配置和环境变量
-- **修改配置** - 安全修改Odoo、Redis和系统配置
-- **系统状态检查** - 全面检查系统健康状态、Redis缓存性能
-- **性能优化** - 🆕 **专用服务器优化**，应用Ubuntu 24.04专用配置
-- **升级** - 🆕 **拉取最新镜像并应用更新**：自动先备份，仅重建 Odoo 容器（数据库容器不动），模块更新在容器启动时自动完成
-
-#### **性能优化功能详解**
-
-脚本提供的性能优化功能包括：
-
-```bash
-sudo ./morhon-odoo.sh
-# 选择：管理实例 -> 性能优化
+```
+1) 查看实例状态    容器与卷的状态
+2) 重启实例        重启 Odoo 与数据库容器
+3) 查看日志        实时查看 Odoo 日志
+4) 备份实例        数据库 + 配置 + 环境变量，打包到 /var/backups/morhon-odoo/
+5) 升级            拉取最新镜像并应用更新（先自动备份）
+6) 返回主菜单
 ```
 
-**优化内容**：
-- ✅ **系统内核参数优化** - Ubuntu版本特定优化
-- ✅ **Docker配置优化** - 容器性能调优
-- ✅ **Nginx配置优化** - 高性能Web服务器配置
-- ✅ **Odoo配置优化** - 智能Worker配置和内存分配
-- ✅ **数据库性能优化** - PostgreSQL参数调优
-- ✅ **Redis缓存优化** - 缓存策略和内存配置
-
-**适用场景**：
-- 🔄 系统升级后重新优化
-- 📈 服务器硬件升级后调优
-- 🛠️ 性能问题排查和优化
-- 🆕 应用Ubuntu 24.04专用优化
+v6.x 里的「修改配置」「系统状态检查」「性能优化」三项已移除：前者做的事就是编辑两个
+文件（直接改更清楚），后两者属于服务器运维，见下面「脚本做什么、不做什么」。
 
 ## 部署模式
 
@@ -493,17 +514,10 @@ sudo ./morhon-odoo.sh upgrade
 - ℹ️ **普通重启很快**：未更换镜像时重启实例为秒级，不会触发全量升级
 ```
 用户访问 → Nginx反向代理 → Odoo应用容器 → PostgreSQL数据库容器
-                                    ↓
-                              Redis缓存容器
 ```
 
-### Redis缓存架构
-```
-Odoo应用层
-├── 应用缓存 (Redis DB0) - 数据查询缓存、计算结果缓存
-├── 会话管理 (Redis DB1) - 用户会话、登录状态
-└── 业务缓存 - 外贸单据缓存、汇率缓存、库存缓存
-```
+只有两个容器。没有独立的缓存服务 —— Odoo 自己的内存缓存加上 Nginx 的静态文件缓存
+已经够用，多一个组件就多一处会坏的地方。
 
 ### 目录结构
 ```
@@ -511,6 +525,7 @@ Odoo应用层
 ├── docker-compose.yml     # Docker编排文件
 ├── .env                   # 环境变量配置
 ├── config/odoo.conf       # Odoo配置文件
+├── ssl/                   # 内网模式的自签证书（域名模式不用这里）
 ├── logs/                  # 应用日志目录
 └── backups/               # 本地备份目录
 
@@ -521,17 +536,14 @@ Odoo应用层
 ### 容器架构
 - **morhon-odoo**: Odoo应用容器
 - **morhon-odoo-db**: PostgreSQL数据库容器
-- **morhon-odoo-redis**: Redis缓存容器（🚀 **性能加速核心**）
 - **morhon-network**: 独立Docker网络
-- **morhon-pg**: 数据库持久化卷（新版本）
-- **morhon-odoo**: Odoo文件持久化卷（新版本）
-- **morhon-redis**: Redis缓存持久化卷
+- **morhon-pg**: 数据库持久化卷
+- **morhon-odoo**: Odoo文件持久化卷
 
 ### 卷名说明
 **新部署实例**：
 - `morhon-pg`（数据库）
 - `morhon-odoo`（应用数据）
-- `morhon-redis`（Redis缓存数据）
 
 **旧版本实例**：
 - `odoo-db-data`（数据库）
@@ -539,156 +551,10 @@ Odoo应用层
 
 **迁移处理**：脚本自动检测并处理卷名差异
 
-## Redis缓存加速系统
-
-### 🚀 **Redis缓存优势**
-
-茂亨Odoo集成了Redis缓存系统，专为外贸管理系统优化，显著提升系统性能：
-
-#### **性能提升效果**
-- 🚀 **页面响应速度提升60%**：常用数据缓存在内存中
-- 🚀 **数据库负载降低70%**：减少重复查询
-- 🚀 **并发处理能力提升50%**：会话管理优化
-- 🚀 **外贸单据处理速度提升40%**：业务数据缓存
-
-#### **缓存架构设计**
-
-```
-Redis缓存分层架构
-├── DB0 (应用缓存) - 12小时过期
-│   ├── 产品信息缓存
-│   ├── 客户数据缓存
-│   ├── 汇率信息缓存
-│   └── 报表计算缓存
-├── DB1 (会话管理) - 8小时过期
-│   ├── 用户登录状态
-│   ├── 权限信息缓存
-│   └── 操作历史记录
-└── 持久化存储
-    ├── AOF日志 (每秒同步)
-    └── RDB快照 (定期备份)
-```
-
-### 🔧 **Redis配置优化**
-
-#### **外贸管理系统专用配置**
-```bash
-# Redis内存配置（根据服务器内存自动调整）
-maxmemory: 1GB (8GB内存服务器)
-maxmemory-policy: allkeys-lru  # 最近最少使用淘汰策略
-
-# 持久化配置
-save 900 1      # 15分钟内有1个key变化就保存
-save 300 10     # 5分钟内有10个key变化就保存
-save 60 10000   # 1分钟内有10000个key变化就保存
-appendonly yes  # 启用AOF持久化
-```
-
-#### **Odoo集成配置**
-```bash
-# 应用缓存配置
-enable_redis = True
-redis_host = redis
-redis_port = 6379
-redis_db = 0
-redis_expiration = 43200  # 12小时过期
-
-# 会话管理配置
-session_redis = True
-session_redis_host = redis
-session_redis_port = 6379
-session_redis_db = 1
-session_timeout = 28800   # 8小时会话超时
-```
-
-### 📊 **缓存性能监控**
-
-#### **通过脚本管理Redis缓存**
-```bash
-sudo ./morhon-odoo.sh
-# 选择：管理实例 -> 修改配置 -> Redis缓存管理
-```
-
-#### **缓存统计信息**
-- ✅ **内存使用情况**：实时监控Redis内存占用
-- ✅ **缓存命中率**：监控缓存效果（目标>90%）
-- ✅ **键数量统计**：各数据库的缓存键数量
-- ✅ **连接数监控**：客户端连接状态
-
-#### **缓存管理功能**
-1. **查看缓存统计** - 实时性能数据
-2. **清空所有缓存** - 系统维护时使用
-3. **清空会话缓存** - 强制用户重新登录
-4. **查看缓存配置** - Redis运行参数
-
-### 🎯 **外贸业务缓存优化**
-
-#### **产品管理缓存**
-- 🔄 **产品信息缓存**：产品详情、价格、库存
-- 🔄 **分类树缓存**：产品分类结构
-- 🔄 **属性缓存**：产品规格、变体信息
-
-#### **客户关系缓存**
-- 👥 **客户信息缓存**：基本信息、联系方式
-- 📞 **沟通记录缓存**：邮件、电话记录
-- 💰 **信用额度缓存**：客户信用状态
-
-#### **财务数据缓存**
-- 💱 **汇率缓存**：实时汇率信息（1小时更新）
-- 📊 **报表缓存**：财务报表计算结果
-- 💳 **应收应付缓存**：账款统计数据
-
-#### **库存管理缓存**
-- 📦 **库存数量缓存**：实时库存状态
-- 🚚 **物流信息缓存**：运输状态、跟踪号
-- 📋 **单据缓存**：采购单、销售单状态
-
-### ⚡ **缓存优化建议**
-
-#### **高性能配置建议**
-```bash
-# 大型外贸企业（100+用户）
-Redis内存: 2-4GB
-缓存策略: allkeys-lru
-持久化: AOF + RDB
-监控频率: 实时
-
-# 中型外贸企业（50-100用户）
-Redis内存: 1-2GB
-缓存策略: allkeys-lru
-持久化: AOF
-监控频率: 每小时
-
-# 小型外贸企业（<50用户）
-Redis内存: 512MB-1GB
-缓存策略: allkeys-lru
-持久化: RDB
-监控频率: 每日
-```
-
-#### **缓存维护策略**
-- 🕐 **定期清理**：每月自动清理过期缓存
-- 📈 **性能监控**：实时监控命中率和内存使用
-- 🔄 **自动重建**：系统重启后自动重建热点缓存
-- 🛡️ **故障恢复**：Redis故障时自动降级到数据库
-
-### 🔒 **缓存安全配置**
-
-#### **网络安全**
-- 🚫 **端口保护**：Redis端口6379仅容器内访问
-- 🔐 **访问控制**：无密码但网络隔离
-- 🛡️ **防火墙规则**：阻止外部直接访问
-
-#### **数据安全**
-- 💾 **持久化备份**：定期备份Redis数据
-- 🔄 **故障恢复**：自动从备份恢复缓存数据
-- 🗑️ **敏感数据清理**：会话过期自动清理
-
 ## 备份和恢复
 
 ### 备份内容
 - 数据库完整备份 (database.sql.gz)
-- Redis缓存备份 (redis-dump.rdb) - 🆕 **缓存数据保护**
 - Odoo配置文件 (config/)
 - Docker Compose配置 (docker-compose.yml)
 - 环境变量 (.env)
@@ -712,7 +578,7 @@ tar -tzf backup_20250107_143022.tar.gz
 tail -f /var/log/morhon-odoo/morhon-odoo.log
 
 # Odoo日志
-sudo docker-compose -f /opt/morhon-odoo/docker-compose.yml logs -f odoo
+sudo docker compose -f /opt/morhon-odoo/docker-compose.yml logs -f odoo
 
 # Nginx日志
 tail -f /var/log/nginx/morhon-odoo-error.log
@@ -725,21 +591,25 @@ sudo ./morhon-odoo.sh
 # 选择：管理实例 -> 重启实例
 
 # 手动重启
-cd /opt/morhon-odoo && sudo docker-compose restart
+cd /opt/morhon-odoo && sudo docker compose restart
 sudo systemctl reload nginx
 ```
 
 ### 修改配置
-```bash
-# 通过脚本修改
-sudo ./morhon-odoo.sh
-# 选择：管理实例 -> 修改配置
 
-# 手动修改
-sudo nano /opt/morhon-odoo/config/odoo.conf
-sudo nano /opt/morhon-odoo/.env
-cd /opt/morhon-odoo && sudo docker-compose restart
+v7.0 移除了「修改配置」菜单 —— 它做的事就是编辑两个文件，直接改更清楚，也不会因为
+中间隔了一层脚本而搞不清到底改了什么。
+
+```bash
+sudo nano /opt/morhon-odoo/config/odoo.conf   # workers、内存限制等
+sudo nano /opt/morhon-odoo/.env               # 部署信息
+cd /opt/morhon-odoo && sudo docker compose restart
 ```
+
+⚠️ **不要改 `.env` 里的 `DB_PASSWORD`。** Postgres 数据卷里存的是旧密码，改了 `.env`
+之后 Odoo 就连不上一个数据完好的数据库，现象是「系统打不开了」而原因很难看出来。
+
+管理员密码请在 Odoo 界面里改（设置 → 用户），不要改 `.env` 里的 `ADMIN_PASSWORD`。
 
 ## 故障排除
 
@@ -755,7 +625,7 @@ chmod +x morhon-odoo.sh
 **2. 容器启动失败**
 ```bash
 sudo docker ps -a
-cd /opt/morhon-odoo && sudo docker-compose logs
+cd /opt/morhon-odoo && sudo docker compose logs
 ```
 
 **3. 无法访问网站**
@@ -777,116 +647,73 @@ sudo certbot certonly --webroot -w /var/www/certbot -d your-domain.com
 **5. 数据库连接失败**
 ```bash
 sudo docker exec morhon-odoo-db pg_isready -U odoo
-cd /opt/morhon-odoo && sudo docker-compose restart db
+cd /opt/morhon-odoo && sudo docker compose restart db
 ```
 
-## 性能和安全优化
+## 性能与安全
 
-### 自动性能优化
+### 脚本会做的性能相关配置
 
-脚本会根据服务器配置自动进行以下优化：
+只限部署这套系统本身需要的部分：
 
-#### Odoo应用层优化
-- **Worker进程**: 根据CPU核心数自动计算 (推荐CPU核心数×2)
-- **内存限制**: 智能分配内存限制，避免OOM
-- **数据库连接池**: 自动配置连接数 (workers×2+4)
-- **Redis缓存配置**: 🚀 **双层缓存架构**，应用缓存+会话管理
-- **缓存过期策略**: 应用缓存12小时，会话缓存8小时
-- **日志优化**: 合理的日志级别和轮转策略
+- **Odoo Worker 数**：按 CPU 核心数与内存自动计算，写入 `config/odoo.conf`
+- **数据库连接池**：随 worker 数一起算好
+- **Nginx 站点配置**：代理缓冲、静态文件缓存 30 天、大附件放行到 500M、
+  长轮询/WebSocket 用 86400s 长超时、报表 600s、单 IP 连接数与请求限速
+- **HTTP 安全头**：X-Frame-Options、X-Content-Type-Options、X-XSS-Protection、
+  Referrer-Policy、X-Robots-Tag
+- **敏感路径拦截**：`/web/database/*`（数据库管理界面）与 `/web/static/` 下的
+  `.py/.pyc/.xml` 一律 403
+- **域名模式**：强制 HTTPS，TLS 1.2 / 1.3
 
-#### Nginx反向代理优化
-- **Worker进程**: 自动设置为CPU核心数
-- **连接数**: 根据系统资源动态调整 (CPU×1024)
-- **缓冲区**: 优化代理缓冲区大小，提升传输效率
-- **Gzip压缩**: 启用智能压缩，减少带宽使用
-- **静态文件缓存**: 7天缓存期，减少服务器负载
-- **连接限制**: 防止DDoS攻击，限制单IP连接数
+### 脚本不再做的
 
-#### 系统内核优化
-- **网络参数**: 优化TCP连接数和超时时间
-- **内存管理**: 调整swap使用策略和脏页回写
-- **文件系统**: 增加文件描述符限制和监控数量
-- **日志轮转**: 自动清理旧日志，防止磁盘满
+系统内核参数、ulimit、Docker daemon 配置、防火墙、SSH 加固、禁用系统服务、安装安全
+扫描工具、系统维护 cron —— v7.0 全部移除，理由见前面「脚本做什么、不做什么」。
 
-### 安全加固措施
+### 按用户规模调 Odoo 参数
 
-#### 网络安全
-- **防火墙**: 自动配置UFW，仅开放必要端口
-- **SSL/TLS**: 强制HTTPS，使用TLS 1.2+加密
-- **安全头部**: 完整的HTTP安全头部配置
-- **连接限制**: 防止暴力破解和DDoS攻击
+脚本已按机器规格自动算好，通常不需要改。确实要手工调时改
+`/opt/morhon-odoo/config/odoo.conf`：
 
-#### 应用安全
-- **数据库隔离**: 禁用数据库管理界面访问
-- **敏感路径保护**: 阻止访问配置文件和备份
-- **文件上传限制**: 限制上传文件类型和大小
-- **会话安全**: 安全的会话超时和管理
-
-#### 系统安全
-- **最小权限**: 容器和服务使用最小权限运行
-- **数据卷隔离**: Docker卷映射，防止直接文件访问
-- **日志审计**: 完整的访问和错误日志记录
-- **自动更新**: SSL证书自动续期
-
-### 性能监控指标
-
-脚本提供的系统状态检查包括：
-
-- **容器健康**: Docker容器运行状态和资源使用
-- **服务状态**: Nginx、数据库服务运行情况
-- **端口监听**: 关键端口的监听状态
-- **磁盘空间**: 存储空间使用情况和预警
-- **内存使用**: 系统和应用内存占用
-- **SSL证书**: 证书有效期和自动续期状态
-
-### 性能调优建议
-
-#### 根据用户数量调优
-
-**小型团队 (1-10人)**:
-```bash
-# Odoo配置调整
+**小型团队 (1-10 人)**
+```
 workers = 2
 limit_memory_hard = 512M
 limit_memory_soft = 384M
 ```
 
-**中型企业 (10-50人)**:
-```bash
-# Odoo配置调整
+**中型企业 (10-50 人)**
+```
 workers = 4
 limit_memory_hard = 1024M
 limit_memory_soft = 768M
 ```
 
-**大型企业 (50-200人)**:
-```bash
-# Odoo配置调整
+**大型企业 (50-200 人)**
+```
 workers = 8
 limit_memory_hard = 2048M
 limit_memory_soft = 1536M
 ```
 
-#### 数据库优化
+改完 `cd /opt/morhon-odoo && sudo docker compose restart`。
+
+### 数据库维护
+
 ```bash
-# 进入数据库容器进行优化
 sudo docker exec -it morhon-odoo-db psql -U odoo postgres
 
-# 数据库维护命令
-VACUUM ANALYZE;  # 清理和分析
-REINDEX DATABASE postgres;  # 重建索引
+VACUUM ANALYZE;              -- 清理与统计信息更新
+REINDEX DATABASE postgres;   -- 重建索引（耗时，建议低峰执行）
 ```
 
-#### 监控和告警
+### 看资源占用
+
 ```bash
-# 查看资源使用情况
 sudo docker stats morhon-odoo morhon-odoo-db
-
-# 查看Nginx状态
 sudo nginx -t && sudo systemctl status nginx
-
-# 查看系统负载
-htop  # 或 top
+top
 ```
 
 ## 系统模块说明
@@ -1052,20 +879,7 @@ max_cron_threads = 4  # 国内服务器性能通常较好
 limit_time_real_cron = 600
 osv_memory_count_limit = 0
 
-- **系统状态检查** - 全面检查系统健康状态、Redis缓存性能
-
-# Redis缓存优化（外贸管理系统专用）
-enable_redis = True
-redis_host = redis
-redis_port = 6379
-redis_db = 0
-redis_expiration = 43200
-
-# 会话管理优化（Redis缓存）
-session_redis = True
-session_redis_host = redis
-session_redis_port = 6379
-session_redis_db = 1
+# 会话与大文件
 session_timeout = 28800
 max_file_upload_size = 268435456  # 256MB，适合国内大文件上传
 
@@ -1073,7 +887,7 @@ max_file_upload_size = 268435456  # 256MB，适合国内大文件上传
 # 可以集成支付宝、微信支付等
 
 # 重启Odoo应用配置
-cd /opt/morhon-odoo && sudo docker-compose restart odoo
+cd /opt/morhon-odoo && sudo docker compose restart odoo
 ```
 
 #### 3. 国内SEO和营销优化
@@ -1136,9 +950,55 @@ location / {
 
 ## 版本历史
 
-**建议方案**：
+### v7.0 (2026-09-11) - 当前版本
 
-### v6.4 (2026-06-20) - 当前版本
+**这一版的主题是「只做部署」。** 脚本从 3245 行减到约 2440 行，去掉的都不是部署功能，
+而是替客户管服务器的部分。
+
+**移除（不再改动你服务器的全局配置）**：
+- 🗑️ 内核参数与 ulimit 调优、`/etc/docker/daemon.json`、磁盘 I/O 调度器
+- 🗑️ 防火墙重置与启用（ufw）、fail2ban / rkhunter / chkrootkit、自动安全更新
+- 🗑️ 修改 `sshd_config` 并重启 sshd、禁用十个系统服务
+- 🗑️ **覆盖 `/etc/nginx/nginx.conf`** —— 改为只往 `conf.d/` 和 `sites-available/` 加文件
+- 🗑️ 系统维护 cron。其中一条是每周 `docker system prune -f --volumes`，
+  在容器停止期间可能删掉数据卷；另一条判断写错，可能每 30 分钟重启一次 docker
+- 🗑️ 手动实例迁移、系统状态检查、性能优化、修改配置四个菜单项
+- 🗑️ `apt-get upgrade -y`（不再替你升级整台机器的包），依赖包从 24 个减到 13 个
+- 🗑️ **文档里从未实现过的 Redis 缓存章节**。脚本里没有任何 Redis 代码，
+  生成的 compose 只有 `odoo` 和 `db` 两个服务 —— 之前的 README 描述了一套不存在的
+  系统，包括容器名、卷名和菜单路径。这是文档错误，不是功能移除
+
+**新增**：
+- ✨ 内网 IP 模式提供 HTTPS（自签证书，10 年有效，`/opt/morhon-odoo/ssl/`）。
+  80 端口仍是主入口，**不强制跳转** —— 理由见「访问方式」
+- ✨ 80 与 443 共用同一份 Nginx 配置片段，不再有两份会各自漂移的副本
+
+**修复（都是能让部署直接失败的问题）**：
+- 🐛 **域名模式从来拿不到 HTTPS**。签证书前就启用了引用不存在证书的 SSL 配置，
+  而 certbot 的 webroot 验证需要一个正在运行的 nginx —— 死锁。现在按
+  「HTTP 配置 → 签证书 → 切 HTTPS 配置」的标准顺序执行
+- 🐛 **全新安装走不下去**。`odoo.conf` 在 `.env` 之前生成，而它要从 `.env` 读密码
+- 🐛 **恢复功能完全不可用**。备份选择菜单打到了 stdout，被调用方当成文件名，
+  `tar` 于是去解压一段菜单文本
+- 🐛 **重装或恢复会锁死数据库**。每次都重新生成 `DB_PASSWORD`，而数据卷里是旧密码。
+  现在已有 `.env` 就沿用其中的密码
+- 🐛 **域名模式被静默降级成内网模式**。向函数传的是变量值而不是变量名，
+  部署模式与域名全部丢失，最后还打印一句域名为空的 `https://`
+- 🐛 **证书到第 90 天会突然过期**。续期用的 `--post-hook` 只在本次调用真的续期了才
+  执行，而 certbot 自带定时器会先把证书续掉 —— 结果 nginx 永远不 reload，
+  磁盘上是新证书、内存里是旧证书。改用 `renewal-hooks/deploy/`，任何一次续期后都生效
+- 🐛 升级时若镜像已是最新，会白等 5 分钟再报一句假的「等待超时」。改为按容器健康状态
+  判断，并明确区分「已是最新」与「镜像已更新，重建中」
+- 🐛 无终端环境（`ssh 主机 "命令"`、nohup、CI）下 `clear` 失败会让脚本在显示菜单前
+  就退出
+- 🐛 Ubuntu 版本判断用的是字符串比较（`[[ "$os_version" < "20.04" ]]`），
+  改为按 major.minor 比整数
+
+**验证**：在一台干净的 Ubuntu 24.04 上完整跑过内网 IP 模式与域名模式（真实域名、
+真实 Let's Encrypt 证书），并验证了备份、恢复（带标记核对数据真的回来了）、升级、
+状态查看，以及「上面那些不会做的事确实一件都没发生」。
+
+### v6.4 (2026-06-20)
 **新增功能**：
 - ✨ **一键升级动作**：管理菜单新增"升级"，并新增 `upgrade` 命令行子命令
 - ✨ 升级流程：自动备份 → 仅拉取并重建 Odoo 容器（数据库容器不动）→ 容器启动时自动应用模块更新
@@ -1157,31 +1017,26 @@ location / {
 - ✨ 增强的跨服务器迁移功能
 - ✨ 系统状态检查和监控
 - ✨ **Ubuntu专用优化**: 仅支持Ubuntu系统，确保最佳兼容性
-- ✨ **Redis缓存系统**: 双层缓存架构，性能提升60%
 - ✨ 容器健康检查配置
-- ✨ **全面性能优化**: 自动调优CPU、内存、网络参数
-- ✨ **系统安全加固**: 内核参数优化、日志轮转、文件描述符限制
 
 **改进优化**：
-- 🔧 更新卷名规范（morhon-pg、morhon-odoo、morhon-redis）
+- 🔧 更新卷名规范（morhon-pg、morhon-odoo）
 - 🔧 **Nginx高性能配置**: 连接限制、缓存优化、Gzip压缩
-- 🔧 **Odoo性能调优**: 智能Worker配置、数据库连接池优化、Redis缓存集成
-- 🔧 **Redis缓存管理**: 实时监控、性能统计、缓存清理功能
+- 🔧 **Odoo性能调优**: 智能Worker配置、数据库连接池优化
 - 🔧 增强错误处理和日志记录
 - 🔧 自动性能参数调优
 
 **安全增强**：
 - 🔒 Docker卷映射防止插件冲突
 - 🔒 **完整安全头部**: CSP、HSTS、XSS保护等
-- 🔒 **敏感路径保护**: 禁止访问数据库管理、配置文件、Redis端口
+- 🔒 **敏感路径保护**: 禁止访问数据库管理界面与配置文件
 - 🔒 **连接限制**: 防DDoS攻击，单IP连接数限制
 - 🔒 **SSL证书自动获取和续期**: HTTPS安全传输
-- 🔒 **Redis安全隔离**: 仅容器内访问，网络隔离保护
 
 **修复问题**：
-- 🐛 兼容性处理：自动检测和迁移旧卷名数据（包含Redis卷）
+- 🐛 兼容性处理：自动检测和迁移旧卷名数据
 - 🐛 修复函数结构和语法错误
-- 🐛 改进备份恢复流程（包含Redis缓存恢复）
+- 🐛 改进备份恢复流程
 
 ### 📞 **技术支持范围说明**
 
