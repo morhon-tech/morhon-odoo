@@ -1,4 +1,4 @@
-# MORHON Odoo 19 — 新实例安装 v8.0
+# MORHON Odoo 19 — 新实例安装 v8.1
 
 `morhon-odoo19.sh` 用于 **Linux amd64 全新实例**，固定 Odoo 19 整包和 PostgreSQL 15 镜像摘要。它不升级 Odoo 17，不接管现有数据库，不修改 trade，也不运行全模块更新。
 
@@ -31,7 +31,7 @@ sudo ./morhon-odoo19.sh start --root /opt/morhon-odoo19
 sudo ./morhon-odoo19.sh backup --root /opt/morhon-odoo19
 ```
 
-备份仅暂停本实例网页服务，生成数据库、filestore 与配置的私有副本及摘要；不会暂停其它网站或主机数据库。**v8.0 不提供自动恢复、在线升级或跨大版本迁移命令**；备份文件应在隔离目标验证后再用于恢复。初始化失败时保留卷和日志；只有尚无任何业务表、序列或视图的受管目标可显式使用 `install --resume-empty`，不会自动删除重建。
+备份仅暂停本实例网页服务，生成数据库、filestore 与配置的私有副本及摘要；不会暂停其它网站或主机数据库。**v8.1 不提供自动恢复、在线升级或跨大版本迁移命令**；备份文件应在隔离目标验证后再用于恢复。初始化失败时保留卷和日志；只有尚无任何业务表、序列或视图的受管目标可显式使用 `install --resume-empty`，不会自动删除重建。
 
 ## 公共 Demo 模式
 
@@ -57,10 +57,16 @@ sudo ./morhon-odoo19.sh install --root /opt/morhon-odoo19-demo
 
 ## 固定载荷
 
-- Odoo：`registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261117-trade-fcaf20d6d02e@sha256:c989bf96a3e14cdba5faa5dcb6ce0a0c80ba1e0ea25bc363cdfbc34fa2db0373`
+- Odoo：`registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261117-ai144-1b4480efef7e@sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755`
 - PostgreSQL：`docker.io/library/postgres@sha256:8a7b3318a33b4c4b366d3ada884d5339d719114e837f0d43776835ff01dec927`
 - Demo 网页转接：`nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284`
-- 整包包含 32 个附加模块、OCR 与既有 Python 依赖；线索分配为 10.12，**不包含尚未发布的 10.13 手动纳入候选**。
+- 整包包含 32 个附加模块、OCR 与既有 Python 依赖；AI 基础库为 1.4.4，仅修复新建／切换服务商的 Odoo 19 兼容错误，未更换模型或自动开启 AI；线索分配为 10.12，**不包含尚未发布的 10.13 手动纳入候选**。
 - 容器镜像包含可提取的模块源码；不包含生产数据库、客户附件、生产配置或凭据。各组件沿用各自许可。
 
 `installer19/` 保存可读源文件；`build_release.py` 只将列明的 Demo 模块、运行保护与合成种子嵌入单文件脚本。发布前应核对脚本 SHA-256 和精确镜像摘要。
+
+## v8.1 与已有实例
+
+本版仅在已发布整包上增加 AI 基础库 1.4.4；其他模块和依赖保持原字节。服务商新建、切换类型、保存、刷新及无密钥校验已验证；真实模型接入仍需使用自己的服务单独联调。
+
+**v8.1 不接管 v8.0 目录或已有数据库。** 已有 v8.0 实例继续使用原 v8.0 脚本管理，可从原固定提交取得。已有库更新 AI 库时须使用独立发布材料中的保设置维护入口；原生模块更新会重载三个 CRM 任务的开关和审计值，禁止裸执行 `-u` 后直接开放任务消费者。受控维护已在同库验证更新、产生新业务后的旧代码恢复及重新应用；没有用旧备份覆盖新增业务。新安装器不提供这项维护动作，也不会自动更新 trade 或公共 Demo。

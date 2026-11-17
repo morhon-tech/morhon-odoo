@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MORHON Odoo19 fresh installer v8.0; no automatic upgrade of existing databases.
+# MORHON Odoo19 fresh installer v8.1; no automatic upgrade of existing databases.
 set -euo pipefail
 exec python3 - "$@" <<'MORHON_ODOO19_PY'
 """MORHON Odoo19 v8: fresh installation only, with an optional isolated demo.
@@ -21,19 +21,19 @@ import time
 if sys.flags.optimize:
     raise SystemExit('This installer requires Python assertions; disable PYTHONOPTIMIZE')
 
-VERSION = '8.0'
-IMAGE = 'registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261117-trade-fcaf20d6d02e@sha256:c989bf96a3e14cdba5faa5dcb6ce0a0c80ba1e0ea25bc363cdfbc34fa2db0373'
+VERSION = '8.1'
+IMAGE = 'registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261117-ai144-1b4480efef7e@sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755'
 POSTGRES = 'docker.io/library/postgres@sha256:8a7b3318a33b4c4b366d3ada884d5339d719114e837f0d43776835ff01dec927'
 EDGE = 'nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284'
 LOCAL_IMAGES = {
-    'web': 'sha256:c9636b18802151905a790053bb5b48db5f6c0bbb05ea67bee16931b0104b684d',
+    'web': 'sha256:47559a65c45f800dca746cc9d71150a6255e817812c02697e7f1f604b8046fb8',
     'db': 'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e',
     'edge': 'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a',
 }
 # Exact manifests produced by this release's verified legacy archive import.
 # Other import/conversion results are intentionally not accepted.
 CONTAINERD_IMAGES = {
-    'web': 'sha256:c989bf96a3e14cdba5faa5dcb6ce0a0c80ba1e0ea25bc363cdfbc34fa2db0373',
+    'web': 'sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755',
     'db': 'sha256:ae81e497630eb7dd45f34f2088c0618d5b330b0d5b648f2b88ad8453ac55bc06',
     'edge': 'sha256:dc8e6d3967a06c0c9bb10d16cfc5770686de05da4c34d4224ef2aec61142e8f1',
 }
