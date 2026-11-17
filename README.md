@@ -10,6 +10,8 @@
 
 网络无法访问镜像仓库时，可从可信来源离线加载**本版完全相同**的三份镜像，再在首次 `prepare` 时显式加 `--offline-images`。该模式按固定 linux/amd64 镜像内容 ID 校验，不自动改用其它标签、镜像站或代理；缺件、错误内容或平台不符即停止。普通模式仍使用下面列出的仓库摘要。离线选项不接管已存在的数据库或卷。
 
+经典 Docker 存储以配置摘要识别镜像；Docker 29 的 containerd 存储使用 manifest 摘要。后者须在首次准备时明确加 `--offline-images --image-store containerd`；随后按安装元数据锁定整套身份，不自动切换。此集合仅绑定本次已核验归档的导入结果（两份配套镜像归档 SHA-256 为 `5123eabb7c6d8cb89d31f277364acd2df843a79e291913c452e7eb2a7a3624fd`），不是对所有 containerd 转换方式的兼容承诺。其它转换生成不同 manifest 时仍拒绝；没有本版可信离线包时使用正常仓库模式，不自行伪造或替换摘要。
+
 ```bash
 chmod +x morhon-odoo19.sh
 sudo ./morhon-odoo19.sh prepare --root /opt/morhon-odoo19

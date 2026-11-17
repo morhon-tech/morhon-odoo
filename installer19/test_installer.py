@@ -73,7 +73,7 @@ class InstallerGuards(unittest.TestCase):
         self.assertEqual(spec['services']['web']['cpus'], 1.5)
         self.assertEqual(spec['services']['web']['environment']['MORHON_PUBLIC_DEMO'], '1')
 
-    def offline_docker(self, platform='amd64', missing=False):
+    def offline_docker(self, platform='amd64', missing=False, ids=None):
         executable = self.directory / 'docker'
         executable.write_text('''#!/usr/bin/env python3
 import sys,json,pathlib
@@ -81,7 +81,8 @@ p=pathlib.Path(__file__).parent
 with (p/'docker-calls.jsonl').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')
 a=sys.argv[1:]
 if a[:2]==['image','inspect']:
- print(json.dumps([{'Id':v,'Os':'linux','Architecture':''' + repr(platform) + '''} for v in a[2:]][:''' + ('1' if missing else '3') + ''']))
+ supplied=''' + repr(ids) + '''
+ print(json.dumps([{'Id':v,'Os':'linux','Architecture':''' + repr(platform) + '''} for v in (a[2:] if supplied is None else supplied)][:''' + ('1' if missing else '3') + ''']))
 elif a[:2]==['volume','inspect']:
  print(json.dumps([{'Labels':{'com.docker.compose.project':'foreign'}}]))
 else:
@@ -108,6 +109,44 @@ else:
     def test_offline_incomplete_image_set_refused_before_volume_inspection(self):
         self.cli('prepare', '--demo', '--offline-images')
         self.cli('install', okay=False, extra_env=self.offline_docker(missing=True))
+        self.assertEqual(len((self.directory / 'docker-calls.jsonl').read_text().splitlines()), 1)
+
+    def test_containerd_requires_explicit_offline_mode(self):
+        self.cli('prepare', '--image-store', 'containerd', okay=False)
+        self.assertFalse(self.root.exists())
+        self.cli('prepare', '--offline-images', '--image-store', 'arbitrary', okay=False)
+        self.assertFalse(self.root.exists())
+
+    def test_containerd_fixed_set_is_reloaded_from_metadata(self):
+        self.cli('prepare', '--demo', '--offline-images', '--image-store', 'containerd')
+        meta = json.loads((self.root / 'installation.json').read_text())
+        self.assertEqual(meta['image_store'], 'containerd')
+        spec = json.loads((self.root / 'compose.json').read_text())
+        expected = {
+            'web': 'sha256:c989bf96a3e14cdba5faa5dcb6ce0a0c80ba1e0ea25bc363cdfbc34fa2db0373',
+            'db': 'sha256:ae81e497630eb7dd45f34f2088c0618d5b330b0d5b648f2b88ad8453ac55bc06',
+            'edge': 'sha256:dc8e6d3967a06c0c9bb10d16cfc5770686de05da4c34d4224ef2aec61142e8f1',
+        }
+        self.assertEqual({n: s['image'] for n, s in spec['services'].items()}, expected)
+        self.cli('install', '--image-store', 'classic', okay=False, extra_env=self.offline_docker())
+        calls = [json.loads(v) for v in (self.directory / 'docker-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(set(calls[0][2:]), set(expected.values()))
+        self.assertEqual(calls[1][:2], ['volume', 'inspect'])
+        self.assertEqual(len(calls), 2)
+
+    def test_containerd_refuses_classic_or_wrong_identity_set(self):
+        self.cli('prepare', '--demo', '--offline-images', '--image-store', 'containerd')
+        result = self.cli('install', okay=False, extra_env=self.offline_docker(ids=[
+            'sha256:c9636b18802151905a790053bb5b48db5f6c0bbb05ea67bee16931b0104b684d',
+            'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e',
+            'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a']))
+        self.assertIn('Offline image identity mismatch', result.stderr)
+        self.assertEqual(len((self.directory / 'docker-calls.jsonl').read_text().splitlines()), 1)
+
+    def test_offline_wrong_digest_refused(self):
+        self.cli('prepare', '--offline-images')
+        result = self.cli('install', okay=False, extra_env=self.offline_docker(ids=['sha256:' + '0' * 64, 'sha256:' + '1' * 64]))
+        self.assertIn('Offline image identity mismatch', result.stderr)
         self.assertEqual(len((self.directory / 'docker-calls.jsonl').read_text().splitlines()), 1)
 
     def test_existing_root_never_overwritten(self):

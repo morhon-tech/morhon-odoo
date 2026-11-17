@@ -26,6 +26,13 @@ LOCAL_IMAGES = {
     'db': 'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e',
     'edge': 'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a',
 }
+# Exact manifests produced by this release's verified legacy archive import.
+# Other import/conversion results are intentionally not accepted.
+CONTAINERD_IMAGES = {
+    'web': 'sha256:c989bf96a3e14cdba5faa5dcb6ce0a0c80ba1e0ea25bc363cdfbc34fa2db0373',
+    'db': 'sha256:ae81e497630eb7dd45f34f2088c0618d5b330b0d5b648f2b88ad8453ac55bc06',
+    'edge': 'sha256:dc8e6d3967a06c0c9bb10d16cfc5770686de05da4c34d4224ef2aec61142e8f1',
+}
 MODULES = 'mail_advance,mail_gateway,mail_gateway_instagram,mail_gateway_whatsapp,mh_ai_assistant,mh_ai_crm,mh_ai_library,mh_ai_mail_translate,mh_base,mh_bilingual_identity,mh_contact_points,mh_crm_metrics,mh_customs_documents,mh_payment_evidence,mh_paypal_invoicing,mh_social,mh_stock_performance,mh_trade_workflow,mh_whatsapp,mh_whatsapp_mail_advance,mh_whatsapp_marketing,mh_workspace_shell,purchase_request,queue_job,sale_advance,social_marketing,social_marketing_facebook,social_marketing_instagram,social_marketing_linkedin,spreadsheet_dashboard_purchase_oca,spreadsheet_dashboard_purchase_stock_oca,stock_delivery_advance'
 FILES = None  # Replaced by build_release.py with the exact public source payload.
 
@@ -46,6 +53,8 @@ def load(root):
     meta = json.loads(p.read_text())
     assert meta['installer_version'] == VERSION and meta['root'] == str(root)
     assert meta['image'] == IMAGE and meta['postgres'] == POSTGRES
+    assert meta.get('image_store', 'classic') in ('classic', 'containerd')
+    assert meta.get('image_store', 'classic') == 'classic' or meta.get('offline_images') is True
     for name, digest in meta['files'].items():
         p = root / name
         assert p.is_file() and not p.is_symlink()
@@ -56,7 +65,9 @@ def load(root):
 def verify_local_images(root):
     """Offline imports must be the same content-addressed linux/amd64 images."""
     spec = json.loads((root / 'compose.json').read_text())
-    expected = {name: LOCAL_IMAGES[name] for name in spec['services']}
+    meta = load(root)
+    identities = CONTAINERD_IMAGES if meta.get('image_store') == 'containerd' else LOCAL_IMAGES
+    expected = {name: identities[name] for name in spec['services']}
     assert {n: s['image'] for n, s in spec['services'].items()} == expected
     result = run(['docker', 'image', 'inspect', *expected.values()], capture_output=True, text=True)
     images = json.loads(result.stdout)
@@ -67,6 +78,7 @@ def verify_local_images(root):
 
 def prepare(args):
     root = args.root
+    assert args.image_store == 'classic' or args.offline_images, 'containerd selection requires explicit offline images'
     assert not root.exists(), 'Refusing to overwrite an existing directory; use status'
     assert re.fullmatch(r'[a-z][a-z0-9_-]{2,39}', args.project)
     assert re.fullmatch(r'[a-z][a-z0-9_]{2,39}', args.database)
@@ -218,8 +230,9 @@ http {
             spec['services'][name].pop('cpus')
             spec['services'][name]['cpu_shares'] = weight
     if args.offline_images:
+        identities = CONTAINERD_IMAGES if args.image_store == 'containerd' else LOCAL_IMAGES
         for name, service in spec['services'].items():
-            service['image'] = LOCAL_IMAGES[name]
+            service['image'] = identities[name]
     payload['compose.json'] = json.dumps(spec, indent=2) + '\n'
     hashes = {}
     for name, content in payload.items():
@@ -234,6 +247,7 @@ http {
         'url': args.url, 'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     meta['cpu_limit_mode'] = 'shares_only' if args.cpu_shares_only else 'hard_quota'
     meta['offline_images'] = args.offline_images
+    meta['image_store'] = args.image_store
     (root / 'installation.json').write_text(json.dumps(meta, indent=2) + '\n')
     (root / 'installation.json').chmod(0o600)
     print(json.dumps({'status': 'PREPARED_NOT_STARTED', 'version': VERSION, 'root': str(root),
@@ -346,6 +360,8 @@ def main():
     parser.add_argument('--database', default='morhon19')
     parser.add_argument('--demo', action='store_true', help='Fixed shared admin/admin and user/user; external services disabled')
     parser.add_argument('--offline-images', action='store_true', help='Prepare using only the exact preloaded linux/amd64 image IDs; never substitutes tags')
+    parser.add_argument('--image-store', choices=['classic', 'containerd'], default='classic',
+        help='Offline ID set: classic config IDs, or this release verified containerd import manifests')
     parser.add_argument('--http-port', type=int, default=18069)
     parser.add_argument('--bus-port', type=int, default=18072)
     parser.add_argument('--url', default='http://localhost:18069')
