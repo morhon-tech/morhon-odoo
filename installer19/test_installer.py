@@ -65,8 +65,8 @@ class InstallerGuards(unittest.TestCase):
         meta = json.loads((self.root / 'installation.json').read_text())
         spec = json.loads((self.root / 'compose.json').read_text())
         self.assertTrue(meta['offline_images'])
-        self.assertIn('@sha256:1ef7c0de', meta['image'])
-        self.assertEqual(spec['services']['web']['image'], 'sha256:47559a65c45f800dca746cc9d71150a6255e817812c02697e7f1f604b8046fb8')
+        self.assertIn('@sha256:40f5b959', meta['image'])
+        self.assertEqual(spec['services']['web']['image'], 'sha256:336f2f7bb619def66a8036a5b5cdab9cee815dd15367b04f3d8ac38b6f80b6da')
         self.assertEqual(spec['services']['db']['image'], 'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e')
         self.assertEqual(spec['services']['edge']['image'], 'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a')
         self.assertTrue(spec['networks']['default']['internal'])
@@ -123,7 +123,7 @@ else:
         self.assertEqual(meta['image_store'], 'containerd')
         spec = json.loads((self.root / 'compose.json').read_text())
         expected = {
-            'web': 'sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755',
+            'web': 'sha256:40f5b959728ef81840ac0e853f596897b6bba438ea54420231210f3e3eb0df0e',
             'db': 'sha256:ae81e497630eb7dd45f34f2088c0618d5b330b0d5b648f2b88ad8453ac55bc06',
             'edge': 'sha256:dc8e6d3967a06c0c9bb10d16cfc5770686de05da4c34d4224ef2aec61142e8f1',
         }
@@ -137,7 +137,7 @@ else:
     def test_containerd_refuses_classic_or_wrong_identity_set(self):
         self.cli('prepare', '--demo', '--offline-images', '--image-store', 'containerd')
         result = self.cli('install', okay=False, extra_env=self.offline_docker(ids=[
-            'sha256:47559a65c45f800dca746cc9d71150a6255e817812c02697e7f1f604b8046fb8',
+            'sha256:336f2f7bb619def66a8036a5b5cdab9cee815dd15367b04f3d8ac38b6f80b6da',
             'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e',
             'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a']))
         self.assertIn('Offline image identity mismatch', result.stderr)

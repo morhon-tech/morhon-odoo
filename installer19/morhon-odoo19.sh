@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MORHON Odoo19 fresh installer v8.1; no automatic upgrade of existing databases.
+# MORHON Odoo19 fresh installer v8.2; no automatic upgrade of existing databases.
 set -euo pipefail
 exec python3 - "$@" <<'MORHON_ODOO19_PY'
 """MORHON Odoo19 v8: fresh installation only, with an optional isolated demo.
@@ -21,19 +21,19 @@ import time
 if sys.flags.optimize:
     raise SystemExit('This installer requires Python assertions; disable PYTHONOPTIMIZE')
 
-VERSION = '8.1'
-IMAGE = 'registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261117-ai144-1b4480efef7e@sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755'
+VERSION = '8.2'
+IMAGE = 'registry.cn-hangzhou.aliyuncs.com/morhon_hub/morhon_odoo:19-20261124-mail76-f952fad4c66f@sha256:40f5b959728ef81840ac0e853f596897b6bba438ea54420231210f3e3eb0df0e'
 POSTGRES = 'docker.io/library/postgres@sha256:8a7b3318a33b4c4b366d3ada884d5339d719114e837f0d43776835ff01dec927'
 EDGE = 'nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284'
 LOCAL_IMAGES = {
-    'web': 'sha256:47559a65c45f800dca746cc9d71150a6255e817812c02697e7f1f604b8046fb8',
+    'web': 'sha256:336f2f7bb619def66a8036a5b5cdab9cee815dd15367b04f3d8ac38b6f80b6da',
     'db': 'sha256:86901ad21dd6f9aa6ee370188595a8bc5b7c36e1b8bdadcd33ecc21c1630135e',
     'edge': 'sha256:c318e336065b17ff460aeac6d14bce5d0b13e35f25d5cb1843b635359fc00c9a',
 }
-# Exact manifests produced by this release's verified legacy archive import.
-# Other import/conversion results are intentionally not accepted.
+# Verified identities: canonical web registry manifest and the unchanged
+# database/edge legacy imports. Other conversion identities are not accepted.
 CONTAINERD_IMAGES = {
-    'web': 'sha256:1ef7c0de0772c67a5d6e668ca0fb604a00bfecf96b98f9407d8e645d0cd52755',
+    'web': 'sha256:40f5b959728ef81840ac0e853f596897b6bba438ea54420231210f3e3eb0df0e',
     'db': 'sha256:ae81e497630eb7dd45f34f2088c0618d5b330b0d5b648f2b88ad8453ac55bc06',
     'edge': 'sha256:dc8e6d3967a06c0c9bb10d16cfc5770686de05da4c34d4224ef2aec61142e8f1',
 }
